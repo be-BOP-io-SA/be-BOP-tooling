@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.1.1"
+readonly SCRIPT_VERSION="2.1.2"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -187,14 +187,40 @@ run_privileged() {
     fi
 }
 
-# ucf wrapper for consistent file management
-ucf_install() {
-    # If the file does not exist and, purge it from the ucf database in case
-    # the user removed it.
-    if [[ ! -f "$2" && -f /var/lib/ucf/hashfile ]]; then
-        run_privileged ucf --purge "$2" || true
+# Wrapper for consistent file management
+install_file() {
+    local source="$1"
+    local destination="$2"
+
+    if [[ -z "$source" || -z "$destination" ]]; then
+        die $EXIT_ERROR "Missing source or destination file"
+    elif [[ ! -f "$source" ]]; then
+        die $EXIT_ERROR "Source file '$source' does not exist"
+    elif [[ "$source" = "$destination" ]]; then
+        die $EXIT_ERROR "Source and destination files are the same: $source"
     fi
-    run_privileged ucf "$1" "$2"
+
+    if has_tool ucf; then
+        # If the file does not exist and, purge it from the ucf database in
+        # case the user removed it.
+        if [[ ! -f "$destination" && -f /var/lib/ucf/hashfile ]]; then
+            run_privileged ucf --purge "$2" || true
+        fi
+        run_privileged ucf "$1" "$2"
+    else
+        # If ucf is not available, prefer install since it will atomically
+        # replace the file.
+        if has_tool install; then
+            run_privileged install "$source" "$destination"
+        else
+            # If install is not available, we have to manually remove the file
+            # and then write the new file.
+            if ! rm -fr "$destination"; then
+                die $EXIT_ERROR "Failed to install $source: Failed to remove $destination"
+            fi
+            run_privileged cp "$source" "$destination"
+        fi
+    fi
 }
 
 # Show usage information
@@ -429,7 +455,7 @@ inspect_system_state() {
 
     # Check what tools are available
     export AVAILABLE_TOOLS=()
-    local potential_commands=("curl" "gpg" "jq" "openssl" "stow" "unzip")
+    local potential_commands=("curl" "gpg" "jq" "openssl" "stow" "unzip" "ucf" "install")
     for cmd in "${potential_commands[@]}"; do
         if command -v "$cmd" >/dev/null 2>&1; then
             AVAILABLE_TOOLS+=("$cmd")
@@ -1316,10 +1342,9 @@ Pin: origin deb.nodesource.com
 Pin-Priority: 600
 EOF
 
-    # Install configuration files using ucf
-    ucf_install "$TMPDIR/nodesource.gpg" /usr/share/keyrings/nodesource.gpg
-    ucf_install "$TMPDIR/nodesource.list" /etc/apt/sources.list.d/nodesource.list
-    ucf_install "$TMPDIR/nodejs" /etc/apt/preferences.d/nodejs
+    install_file "$TMPDIR/nodesource.gpg" /usr/share/keyrings/nodesource.gpg
+    install_file "$TMPDIR/nodesource.list" /etc/apt/sources.list.d/nodesource.list
+    install_file "$TMPDIR/nodejs" /etc/apt/preferences.d/nodejs
 
     # Cleanup
     rm -rf "$TMPDIR"
@@ -1377,9 +1402,8 @@ configure_mongodb_repo() {
 deb [arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/${distribution} ${release}/mongodb-org/${MONGODB_VERSION} ${archive}
 EOF
 
-    # Install configuration files using ucf
-    ucf_install "$TMPDIR/mongodb-server-8.0.gpg" /usr/share/keyrings/mongodb-server-8.0.gpg
-    ucf_install "$TMPDIR/mongodb-org-8.0.list" /etc/apt/sources.list.d/mongodb-org-${MONGODB_VERSION}.list
+    install_file "$TMPDIR/mongodb-server-8.0.gpg" /usr/share/keyrings/mongodb-server-8.0.gpg
+    install_file "$TMPDIR/mongodb-org-8.0.list" /etc/apt/sources.list.d/mongodb-org-${MONGODB_VERSION}.list
 
     # Cleanup
     rm -rf "$TMPDIR"
@@ -1574,8 +1598,7 @@ server {
 EOF
     fi
 
-    # Install configuration using ucf
-    ucf_install "$TMPDIR/be-BOP.conf" /etc/nginx/sites-available/be-BOP.conf
+    install_file "$TMPDIR/be-BOP.conf" /etc/nginx/sites-available/be-BOP.conf
     run_privileged ln -sf /etc/nginx/sites-available/be-BOP.conf /etc/nginx/sites-enabled/
 
     # Test nginx configuration
@@ -1730,9 +1753,8 @@ EOF
         sed -i 's|MINIO_SERVER_URL=https://|MINIO_SERVER_URL=http://|' "$TMPDIR/config.env"
     fi
 
-    # Install configuration using ucf
     run_privileged mkdir -p /etc/minio
-    ucf_install "$TMPDIR/config.env" /etc/minio/config.env
+    install_file "$TMPDIR/config.env" /etc/minio/config.env
     # Ensure it's world-readable (so the configured domain can be checked)
     run_privileged chmod 644 /etc/minio/config.env
 
@@ -1780,9 +1802,8 @@ EOF
         sed -i 's|PUBLIC_S3_ENDPOINT_URL=https://|PUBLIC_S3_ENDPOINT_URL=http://|' "$TMPDIR/config.env"
     fi
 
-    # Install configuration using ucf
     run_privileged mkdir -p /etc/be-BOP
-    ucf_install "$TMPDIR/config.env" /etc/be-BOP/config.env
+    install_file "$TMPDIR/config.env" /etc/be-BOP/config.env
     # Ensure it's world-readable (so the configured domain can be checked)
     run_privileged chmod 644 /etc/be-BOP/config.env
 
@@ -1833,8 +1854,7 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 EOF
 
-    # Install service file using ucf
-    ucf_install "$TMPDIR/phoenixd.service" /etc/systemd/system/phoenixd.service
+    install_file "$TMPDIR/phoenixd.service" /etc/systemd/system/phoenixd.service
     run_privileged systemctl daemon-reload
 
     # Cleanup
@@ -1886,8 +1906,7 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 EOF
 
-    # Install service file using ucf
-    ucf_install "$TMPDIR/minio.service" /etc/systemd/system/minio.service
+    install_file "$TMPDIR/minio.service" /etc/systemd/system/minio.service
     run_privileged systemctl daemon-reload
 
     # Cleanup
@@ -1939,8 +1958,7 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 EOF
 
-    # Install service file using ucf
-    ucf_install "$TMPDIR/bebop.service" /etc/systemd/system/bebop.service
+    install_file "$TMPDIR/bebop.service" /etc/systemd/system/bebop.service
     run_privileged systemctl daemon-reload
 
     # Cleanup
@@ -1978,7 +1996,7 @@ EOF
 
     # Create override directory and install configuration
     run_privileged mkdir -p /etc/systemd/system/phoenixd.service.d
-    ucf_install "$TMPDIR/overrides.conf" /etc/systemd/system/phoenixd.service.d/overrides.conf
+    install_file "$TMPDIR/overrides.conf" /etc/systemd/system/phoenixd.service.d/overrides.conf
     run_privileged systemctl daemon-reload
 
     # Cleanup
@@ -2015,7 +2033,7 @@ EOF
 
     # Create override directory and install configuration
     run_privileged mkdir -p /etc/systemd/system/minio.service.d
-    ucf_install "$TMPDIR/overrides.conf" /etc/systemd/system/minio.service.d/overrides.conf
+    install_file "$TMPDIR/overrides.conf" /etc/systemd/system/minio.service.d/overrides.conf
     run_privileged systemctl daemon-reload
 
     # Cleanup
@@ -2051,7 +2069,7 @@ EOF
 
     # Create override directory and install configuration
     run_privileged mkdir -p /etc/systemd/system/bebop.service.d
-    ucf_install "$TMPDIR/overrides.conf" /etc/systemd/system/bebop.service.d/overrides.conf
+    install_file "$TMPDIR/overrides.conf" /etc/systemd/system/bebop.service.d/overrides.conf
     run_privileged systemctl daemon-reload
 
     # Cleanup
