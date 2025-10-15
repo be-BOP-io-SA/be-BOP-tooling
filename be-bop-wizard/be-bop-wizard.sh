@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.1.3"
+readonly SCRIPT_VERSION="2.2.0"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -56,7 +56,7 @@ readonly BEBOP_GITHUB_REPO="${BEBOP_GITHUB_REPO:-be-BOP-io-SA/be-BOP}"
 # Exit codes
 readonly EXIT_SUCCESS=0
 readonly EXIT_ERROR=1
-readonly EXIT_FATAL=2
+readonly EXIT_INCOMPATIBLE_SYSTEM_STATE=2
 readonly EXIT_USER_ABORT=3
 
 # Network and timeout constants
@@ -468,46 +468,56 @@ check_privileges() {
     fi
 }
 
-# Environment detection
-detect_environment() {
-    log_info "Detecting system environment..."
+detect_os_information() {
+    local id name release pretty
 
-    # Check OS
-    if [[ ! -f /etc/os-release ]]; then
-        die $EXIT_FATAL $LINENO "/etc/os-release not found. Unsupported system."
+    if [ -r /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        id="${ID:-unknown}"
+        name="${NAME:-${ID:-Unknown}}"
+        release="${VERSION_CODENAME:-${VERSION_ID:-unknown}}"
+        pretty="${PRETTY_NAME:-${NAME} ${VERSION_ID}}"
+
+    elif command -v lsb_release >/dev/null 2>&1; then
+        id=$(lsb_release -si | tr '[:upper:]' '[:lower:]')
+        name=$(lsb_release -si)
+        release=$(lsb_release -sc)
+        pretty=$(lsb_release -sd | tr -d '"')
+
+    elif [ "$(uname -s)" = "FreeBSD" ]; then
+        id="freebsd"
+        name="FreeBSD"
+        release=$(freebsd-version | cut -d- -f1)
+        pretty="FreeBSD $(freebsd-version)"
+
+    else
+        id=$(uname -s | tr '[:upper:]' '[:lower:]')
+        name=$(uname -s)
+        release=$(uname -r)
+        pretty="$name $release"
     fi
 
-    source /etc/os-release
-    log_debug "Detected OS: $PRETTY_NAME"
+    export DETECTED_MACHINE_OS_NAME="$id"
+    export DETECTED_MACHINE_OS_RELEASE="$release"
+    export DETECTED_HUMAN_OS_DISTRIBUTION="$pretty"
+}
 
-    # Check if Debian-based
-    if [[ "$ID" != "debian" && "$ID" != "ubuntu" ]]; then
-        die $EXIT_FATAL $LINENO "Unsupported OS: $ID. This script requires Debian or Ubuntu."
+is_systemd_operational() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return 1
+    fi
+    if [ "$(ps -p 1 -o comm=)" != "systemd" ]; then
+        return 1
     fi
 
-    # Check package manager
-    if ! command -v apt >/dev/null 2>&1; then
-        die $EXIT_FATAL $LINENO "apt package manager not found. This script requires Debian/Ubuntu with apt."
-    fi
+    local state
+    state=$(systemctl is-system-running 2>/dev/null || true)
 
-    # Check systemd available
-    if ! command -v systemctl &>/dev/null; then
-        die $EXIT_FATAL $LINENO "systemd not found. This script requires systemd."
-    fi
-
-    # Detect container environment
-    local container_type="none"
-    if command -v systemd-detect-virt >/dev/null 2>&1; then
-        container_type=$(systemd-detect-virt --container 2>/dev/null || true)
-    fi
-
-    log_info "Environment: $PRETTY_NAME"
-    log_info "Container: $container_type"
-
-    # Store environment info in global variables for later use
-    export DETECTED_OS="$ID"
-    export DETECTED_VERSION="$VERSION_CODENAME"
-    export DETECTED_CONTAINER="$container_type"
+    case "$state" in
+        running|degraded) return 0 ;;  # good enough
+        *) return 1 ;;
+    esac
 }
 
 # ---[ 1. Inspect the system ]---
@@ -522,11 +532,6 @@ inspect_system_state() {
     # Initialize system facts array
     export SYSTEM_STATE=()
 
-    # Check if running in container
-    if [[ "$DETECTED_CONTAINER" != "none" ]]; then
-        SYSTEM_STATE+=("running_in_container")
-    fi
-
     if [[ -n "${DOMAIN:-}" ]]; then
         SYSTEM_STATE+=("specified_domain=${DOMAIN}")
     fi
@@ -535,20 +540,59 @@ inspect_system_state() {
         SYSTEM_STATE+=("specified_email=${EMAIL}")
     fi
 
+    detect_os_information
+    SYSTEM_STATE+=("os_name=${DETECTED_MACHINE_OS_NAME}")
+    SYSTEM_STATE+=("os_release=${DETECTED_MACHINE_OS_RELEASE}")
+
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        local container_type="none"
+        container_type=$(systemd-detect-virt --container 2>/dev/null || true)
+        if [[ "$container_type" != "none" ]]; then
+            SYSTEM_STATE+=("running_in_container")
+        fi
+    fi
+
     # Check what tools are available
+    local potential_commands=(
+        "apt"
+        "curl"
+        "gpg"
+        "install"
+        "jq"
+        "mongosh"
+        "openssl"
+        "stow"
+        "ucf"
+        "unzip"
+    )
     export AVAILABLE_TOOLS=()
-    local potential_commands=("curl" "gpg" "jq" "openssl" "stow" "unzip" "ucf" "install")
     for cmd in "${potential_commands[@]}"; do
         if command -v "$cmd" >/dev/null 2>&1; then
             AVAILABLE_TOOLS+=("$cmd")
         fi
     done
-    local potential_packages=("certbot" "nginx" "python3-certbot-nginx" "ssl-cert")
-    for pkg in "${potential_packages[@]}"; do
-        if dpkg -s "$pkg" >/dev/null 2>&1; then
-            AVAILABLE_TOOLS+=("$pkg")
-        fi
-    done
+    local potential_packages=(
+        "certbot"
+        "mongodb-org"
+        "nginx"
+        "python3-certbot-nginx"
+        "ssl-cert"
+    )
+    if command -v dpkg >/dev/null 2>&1; then
+        for pkg in "${potential_packages[@]}"; do
+            if dpkg -s "$pkg" >/dev/null 2>&1; then
+                AVAILABLE_TOOLS+=("$pkg")
+            fi
+        done
+    fi
+
+    # Check if systemd is operational
+    if is_systemd_operational; then
+        SYSTEM_STATE+=("systemd_operational")
+    fi
+    if has_fact systemd_operational && command -v systemctl >/dev/null 2>&1; then
+        AVAILABLE_TOOLS+=("systemctl")
+    fi
 
     log_debug "Available tools: ${AVAILABLE_TOOLS[*]}"
 
@@ -572,28 +616,25 @@ inspect_system_state() {
         SYSTEM_STATE+=("mongodb_repo_configured")
     fi
 
-    if dpkg -s mongodb-org >/dev/null 2>&1; then
+    if has_tool mongodb-org >/dev/null 2>&1; then
         SYSTEM_STATE+=("mongodb_installed")
     fi
 
-    if systemctl is-active --quiet mongod 2>/dev/null; then
+    if has_tool systemctl && systemctl is-active --quiet mongod 2>/dev/null || \
+        has_tool mongosh && mongosh --quiet --eval "db.adminCommand('ping')" >/dev/null 2>&1; then
         SYSTEM_STATE+=("mongodb_running")
     fi
 
-    if command -v mongosh >/dev/null && mongosh --quiet --eval "rs.status().ok" 2>/dev/null | grep -q "1"; then
+    if has_tool mongosh && mongosh --quiet --eval "rs.status().ok" 2>/dev/null | grep -q "1"; then
         SYSTEM_STATE+=("mongodb_rs_initialized")
     fi
 
-    if command -v nginx >/dev/null 2>&1; then
-        SYSTEM_STATE+=("nginx_installed")
-    fi
-
-    if systemctl is-active --quiet nginx 2>/dev/null; then
+    if has_tool systemctl && systemctl is-active --quiet nginx 2>/dev/null; then
         SYSTEM_STATE+=("nginx_running")
     fi
 
     # Check SSL certificate availability (check package instead of private key due to permissions)
-    if dpkg -s ssl-cert >/dev/null 2>&1 && [[ -f /etc/ssl/certs/ssl-cert-snakeoil.pem ]]; then
+    if has_tool ssl-cert >/dev/null 2>&1 && [[ -f /etc/ssl/certs/ssl-cert-snakeoil.pem ]]; then
         SYSTEM_STATE+=("snakeoil_cert_available")
     fi
 
@@ -628,7 +669,7 @@ inspect_system_state() {
             fi
 
             # Test if the site responds (allow up to 5 seconds)
-            if command -v curl >/dev/null 2>&1; then
+            if has_tool curl; then
                 local response_code=$(curl "${curl_args[@]}" "$test_url" 2>/dev/null || echo "000")
                 # Accept any 2xx, 3xx, 4xx response (shows nginx is routing correctly)
                 if [[ "$response_code" =~ ^[234][0-9][0-9]$ ]]; then
@@ -638,16 +679,16 @@ inspect_system_state() {
         fi
     fi
 
-    if command -v certbot >/dev/null 2>&1; then
+    if has_tool certbot; then
         SYSTEM_STATE+=("certbot_installed")
     fi
 
-    if systemctl is-active --quiet minio 2>/dev/null; then
+    if has_tool systemctl && systemctl is-active --quiet minio 2>/dev/null; then
         SYSTEM_STATE+=("minio_running")
     fi
 
     # Check if MinIO is available but service not running (try HTTP check as fallback)
-    if ! has_fact "minio_running" && command -v curl >/dev/null 2>&1; then
+    if has_tool curl && ! has_fact "minio_running"; then
         # Check if MinIO is responding via HTTP (even if systemctl doesn't show it as active)
         local curl_args=(
             "--connect-timeout" "$CURL_CONNECT_TIMEOUT"
@@ -664,7 +705,7 @@ inspect_system_state() {
         fi
     fi
 
-    if systemctl is-active --quiet bebop 2>/dev/null; then
+    if has_tool systemctl && systemctl is-active --quiet bebop 2>/dev/null; then
         SYSTEM_STATE+=("bebop_running")
     fi
 
@@ -685,7 +726,7 @@ inspect_system_state() {
         SYSTEM_STATE+=("minio_installed")
     fi
 
-    if systemctl is-active --quiet phoenixd 2>/dev/null; then
+    if has_tool systemctl && systemctl is-active --quiet phoenixd 2>/dev/null; then
         SYSTEM_STATE+=("phoenixd_running")
     fi
 
@@ -857,8 +898,8 @@ get_fact() {
 # will be empty and LATEST_RELEASE_ASSET_BASENAME unset. This can happen if
 # `jq` is not installed or we're unable to obtain the data from GitHub.
 determine_latest_release_meta() {
-    if ! command -v jq > /dev/null; then
-        log_debug "Could not fetch latest be-BOP release metadata since jq is not installed"
+    if ! has_tool jq || ! has_tool curl; then
+        log_debug "Could not fetch latest be-BOP release metadata since jq or curl is not installed"
         export LATEST_RELEASE_META=""
         return 0
     fi
@@ -881,6 +922,152 @@ determine_latest_release_meta() {
     '
     if [[ -n "$LATEST_RELEASE_META" ]]; then
         export LATEST_RELEASE_ASSET_BASENAME=$(echo "$LATEST_RELEASE_META" | jq -r "$filter" | head -n 1)
+    fi
+}
+
+die_unsupported_os_distribution_for_tasks() {
+    local tasks=("$@")
+    local distro_name="${DETECTED_HUMAN_OS_DISTRIBUTION:-}"
+    local comment=""
+    if ! has_fact systemd_operational; then
+        comment="(systemd not operational)"
+    fi
+
+    local task_descriptions=()
+    for task in "${tasks[@]}"; do
+        local description
+        if description="$(describe_task "$task")"; then
+            task_descriptions+=("$description")
+        fi
+    done
+
+    if [[ -n "$distro_name" ]]; then
+        log_error "Unsupported OS distribution: $distro_name $comment"
+    else
+        log_error "Unsupported unknown OS distribution $comment"
+    fi
+    log_error "The script paused to prevent any potential issues."
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "💡 The script stopped safely — your Linux or BSD distribution is not supported yet."
+    echo ""
+    if [[ -n "$distro_name" ]]; then
+        echo "Your operating system distribution appears to be:"
+        echo "   • ${distro_name} $comment"
+        echo ""
+    fi
+    if [[ "${tasks[*]}" =~ install_missing_tools ]]; then
+        echo "We couldn’t verify that all the necessary tools are installed, and this script"
+        echo "does not yet know how to install them automatically on your distribution."
+        echo ""
+        echo "The following tools are necessary but could not be found:"
+        for tool in "${INSTALL_TOOLS[@]}"; do
+            echo "   • ${tool}"
+        done
+        echo ""
+        echo "You have two safe options to continue:"
+        echo "   1. Install the missing tools manually using your distribution’s package system."
+        echo "   2. Reach out and tell us your distribution name — we're always looking to make"
+        echo "      the wizard smarter and compatible with more systems 🧙."
+    elif [[ "${tasks[*]}" =~ configure_mongodb_repo ]]; then
+        echo "We couldn’t verify that MongoDB is installed, and this script doesn’t yet know"
+        echo "how to install MongoDB automatically on your distribution."
+        echo ""
+        echo "You have two safe options to continue:"
+        echo "   1. Install MongoDB manually using your distribution’s package system"
+        echo "      and ensure command mongosh is available."
+        echo "   2. Reach out and tell us your distribution name — we're always looking to make"
+        echo "      the wizard smarter and compatible with more systems 🧙."
+    else
+        if [[ ${#task_descriptions[@]} -ne 0 ]]; then
+            echo "This script doesn’t yet know how to perform the following task in your"
+            echo "distribution’s environment:"
+            for description in "${task_descriptions[@]}"; do
+                echo "   • ${description}"
+            done
+            echo ""
+            echo "Please reach out and tell us your distribution name — we're always looking to"
+            echo "make the wizard smarter and compatible with more systems 🧙."
+        else
+            echo "This script doesn’t yet know how to work with your distribution’s environment"
+            echo "or package system. Please reach out and tell us your distribution name — we're"
+            echo "always looking to make the wizard smarter and compatible with more systems 🧙."
+        fi
+    fi
+    echo ""
+    echo "🪪 Contact options:"
+    echo "   - Email: contact@be-bop.io"
+    echo "   - Nostr: npub16l9pnrkhhagkucjhxvvztz2czv9ex8s5u7yg80ghw9ccjp4j25pqaku4ha"
+    echo ""
+    echo "📡 Stay tuned for new distribution support and updates:"
+    echo "   → https://be-bop.io/release-note"
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    exit "$EXIT_INCOMPATIBLE_SYSTEM_STATE"
+}
+
+check_os_supported_by_wizard() {
+    local unsupported_tasks=()
+
+    local os_name="$(get_fact os_name)"
+    local os_release="$(get_fact os_release)"
+    case "$os_name-$os_release" in
+        debian-bookworm) ;;
+        debian-bullseye) ;;
+        debian-buster) ;;
+        debian-jessie) ;;
+        debian-stretch) ;;
+        debian-wheezy) ;;
+        ubuntu-bionic) ;;
+        ubuntu-focal) ;;
+        ubuntu-jammy) ;;
+        ubuntu-noble) ;;
+        ubuntu-precise) ;;
+        ubuntu-trusty) ;;
+        ubuntu-xenial) ;;
+        *)
+            if [[ "${TASK_PLAN[*]}" =~ "configure_mongodb_repo" ]]; then
+                unsupported_tasks+=("configure_mongodb_repo")
+            fi
+            ;;
+    esac
+    if [[ ${#INSTALL_TOOLS[@]} -ne 0 ]] && ! has_tool apt; then
+        unsupported_tasks+=("install_missing_tools")
+    fi
+    local tasks_requiring_apt=(
+        "configure_mongodb_repo"
+        "configure_nodejs_repo"
+        "install_mongodb"
+        "install_nodejs"
+    )
+    for task in "${tasks_requiring_apt[@]}"; do
+        if [[ "${TASK_PLAN[*]}" =~ "$task" ]] && ! has_tool apt; then
+            unsupported_tasks+=("$task")
+        fi
+    done
+    local tasks_requiring_systemd_operational=(
+        "configure_bebop_hardening_overrides"
+        "configure_minio_hardening_overrides"
+        "configure_phoenixd_hardening_overrides"
+        "initialize_mongodb_rs"
+        "install_bebop_service"
+        "install_minio_service"
+        "install_phoenixd_service"
+        "reload_nginx"
+        "restart_bebop"
+        "restart_minio"
+        "start_and_enable_bebop"
+        "start_and_enable_minio"
+        "start_and_enable_nginx"
+        "start_and_enable_phoenixd"
+    )
+    for task in "${tasks_requiring_systemd_operational[@]}"; do
+        if [[ "${TASK_PLAN[*]}" =~ "$task" ]] && ! has_fact systemd_operational; then
+            unsupported_tasks+=("$task")
+        fi
+    done
+    if [[ ${#unsupported_tasks[@]} -ne 0 ]]; then
+        die_unsupported_os_distribution_for_tasks "${unsupported_tasks[@]}"
     fi
 }
 
@@ -1065,7 +1252,7 @@ handle_missing_flags() {
     echo ""
     echo "Once you add the missing flag(s), just re-run the script — it’ll pick up right it left off."
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    exit 1
+    exit "$EXIT_ERROR"
 }
 
 list_tools_for_task() {
@@ -1152,7 +1339,7 @@ summarize_state_and_plan() {
             echo "✓ be-BOP site enabled"
         elif has_fact "nginx_running"; then
             echo "⚠ installed but not running"
-        elif has_fact "nginx_installed"; then
+        elif has_tool nginx; then
             echo "⚠ installed but not running"
         else
             echo "✗ missing"
@@ -1247,8 +1434,10 @@ summarize_state_and_plan() {
     if email="$(get_fact "specified_email")"; then
         echo "Email: $email"
     fi
-    echo "Environment: $DETECTED_OS $DETECTED_VERSION"
-    echo ""
+    if [[ -n "${DETECTED_HUMAN_OS_DISTRIBUTION:-}" ]]; then
+        echo "Environment: $DETECTED_HUMAN_OS_DISTRIBUTION"
+        echo ""
+    fi
 
     echo "Current system status:"
     echo "  • Node.js: $(nodejs_state)"
@@ -1349,8 +1538,11 @@ describe_task() {
         "start_and_enable_phoenixd") echo "Start and enable phoenixd service" ;;
         "write_bebop_configuration") echo "Write be-BOP configuration" ;;
         "write_minio_configuration") echo "Write MinIO configuration" ;;
-        *) echo "Unknown action: $1" ;;
+        *)
+            return 1
+            ;;
     esac
+    return 0
 }
 
 # ---[ 6. Run the tasks ]---
@@ -1436,29 +1628,21 @@ EOF
 configure_mongodb_repo() {
     log_info "Configuring MongoDB repository..."
 
-    local distribution="$DETECTED_OS"
-    local release="$DETECTED_VERSION"
-    log_debug "Installing mongodb repository for ${distribution} ${release}"
+    local os_name="$(get_fact "os_name")"
+    local os_release="$(get_fact "os_release")"
+    log_debug "Installing mongodb repository for ${os_name} ${os_release}"
 
-    # Determine archive component
-    case "$distribution" in
-        ubuntu)
-            local archive="multiverse"
-            ;;
-        debian)
+    case "$os_name-$os_release" in
+        debian-bookworm|debian-bullseye|debian-buster|debian-jessie|debian-stretch|debian-wheezy)
             local archive="main"
             ;;
-        *)
-            die $EXIT_FATAL $LINENO "Unsupported distribution: ${distribution}"
-            ;;
-    esac
-
-    # Validate supported releases
-    case "$distribution-$release" in
-        ubuntu-noble|ubuntu-jammy|ubuntu-focal|debian-bookworm)
+        ubuntu-bionic|ubuntu-focal|ubuntu-jammy|ubuntu-noble|ubuntu-precise|ubuntu-trusty|ubuntu-xenial)
+            local archive="multiverse"
             ;;
         *)
-            die $EXIT_FATAL $LINENO "Unsupported release: ${distribution} ${release}"
+            # We should not reach this case: check_os_supported_by_wizard should
+            # have explained the user the distribution is unsupported.
+            die $EXIT_ERROR $LINENO "Unsupported distribution: ${os_name} ${os_release}"
             ;;
     esac
 
@@ -1481,7 +1665,7 @@ configure_mongodb_repo() {
     # Create repository configuration
     cat > "$TMPDIR/mongodb-org-8.0.list" << EOF
 # This file is managed by be-bop-wizard
-deb [arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/${distribution} ${release}/mongodb-org/${MONGODB_VERSION} ${archive}
+deb [arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/${os_name} ${os_release}/mongodb-org/${MONGODB_VERSION} ${archive}
 EOF
 
     install_file "$TMPDIR/mongodb-server-8.0.gpg" /usr/share/keyrings/mongodb-server-8.0.gpg
@@ -2358,11 +2542,11 @@ main() {
     check_privileges
 
     # Detect environment and inspect system state
-    detect_environment
     determine_latest_release_meta
     inspect_system_state
     plan_setup_tasks
     collect_all_required_tools
+    check_os_supported_by_wizard
 
     summarize_state_and_plan
 
