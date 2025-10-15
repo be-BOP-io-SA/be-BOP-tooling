@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.1.0"
+readonly SCRIPT_VERSION="2.1.1"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -57,6 +57,25 @@ readonly BEBOP_GITHUB_REPO="${BEBOP_GITHUB_REPO:-be-BOP-io-SA/be-BOP}"
 readonly EXIT_SUCCESS=0
 readonly EXIT_ERROR=1
 readonly EXIT_FATAL=2
+
+# Network and timeout constants
+readonly CURL_CONNECT_TIMEOUT=${CURL_CONNECT_TIMEOUT:-5}
+readonly CURL_DOWNLOAD_TIMEOUT=${CURL_DOWNLOAD_TIMEOUT:-300}
+readonly SERVICE_TEST_START_RETRIES=10
+readonly SERVICE_TEST_START_WAIT_SECONDS=3
+
+# Software versions
+# WARNING: Do not simply change these version numbers without careful consideration!
+# Changing versions may require updating installation scripts, configuration templates,
+# compatibility checks, and cleanup procedures for existing installations.
+# On each version change the logic for provisioning the version be reviewed to install
+# and prefer the newer version, possibly remove the previous version while keeping the
+# script “safe”: For example, the previous version repositories can only be removed if
+# a newer version is already installed.
+readonly NODEJS_MAJOR_VERSION=22
+readonly MONGODB_VERSION="8.0"
+readonly PHOENIXD_VERSION="0.6.2"
+readonly MINIO_VERSION="RELEASE.2025-09-07T16-13-09Z"
 
 # Error trap handler
 handle_error() {
@@ -441,7 +460,7 @@ inspect_system_state() {
         SYSTEM_STATE+=("pnpm_available")
     fi
 
-    if [[ -f /etc/apt/sources.list.d/mongodb-org-8.0.list ]]; then
+    if [[ -f /etc/apt/sources.list.d/mongodb-org-${MONGODB_VERSION}.list ]]; then
         SYSTEM_STATE+=("mongodb_repo_configured")
     fi
 
@@ -483,9 +502,16 @@ inspect_system_state() {
             log_debug "I cannot check the be-BOP site is available without a domain."
         elif has_fact "nginx_running" && has_fact "bebop_site_enabled"; then
             local test_url
-            local curl_args=("--silent" "--output" "/dev/null" "--write-out" "%{http_code}")
-            local domain="$(get_fact "specified_domain")"
+            local curl_args=(
+                "--connect-timeout" "$CURL_CONNECT_TIMEOUT"
+                "--fail"
+                "--max-time" "$CURL_DOWNLOAD_TIMEOUT"
+                "--output" "/dev/null"
+                "--silent"
+                "--write-out" "%{http_code}"
+            )
 
+            local domain="$(get_fact "specified_domain")"
             if [[ "$domain" = "localhost" ]]; then
                 test_url="http://localhost/"
             else
@@ -495,7 +521,7 @@ inspect_system_state() {
 
             # Test if the site responds (allow up to 5 seconds)
             if command -v curl >/dev/null 2>&1; then
-                local response_code=$(curl "${curl_args[@]}" --connect-timeout 5 "$test_url" 2>/dev/null || echo "000")
+                local response_code=$(curl "${curl_args[@]}" "$test_url" 2>/dev/null || echo "000")
                 # Accept any 2xx, 3xx, 4xx response (shows nginx is routing correctly)
                 if [[ "$response_code" =~ ^[234][0-9][0-9]$ ]]; then
                     SYSTEM_STATE+=("bebop_site_running")
@@ -515,7 +541,16 @@ inspect_system_state() {
     # Check if MinIO is available but service not running (try HTTP check as fallback)
     if ! has_fact "minio_running" && command -v curl >/dev/null 2>&1; then
         # Check if MinIO is responding via HTTP (even if systemctl doesn't show it as active)
-        local minio_response=$(curl --silent --fail --output /dev/null --write-out "%{http_code}" --connect-timeout 5 "http://localhost:9000/minio/health/live" 2>/dev/null || echo "000")
+        local curl_args=(
+            "--connect-timeout" "$CURL_CONNECT_TIMEOUT"
+            "--fail"
+            "--max-time" "$CURL_DOWNLOAD_TIMEOUT"
+            "--output" "/dev/null"
+            "--silent"
+            "--write-out" "%{http_code}"
+        )
+        local url="http://localhost:9000/minio/health/live"
+        local minio_response=$(curl "${curl_args[@]}" "$url" 2>/dev/null || echo "000")
         if [[ "$minio_response" =~ ^[234][0-9][0-9]$ ]]; then
             SYSTEM_STATE+=("minio_running")
         fi
@@ -720,8 +755,15 @@ determine_latest_release_meta() {
         return 0
     fi
     log_info "📡 Fetching latest be-BOP release metadata..."
+    local curl_args=(
+        "--connect-timeout" "$CURL_CONNECT_TIMEOUT"
+        "--fail"
+        "--location"
+        "--max-time" "$CURL_DOWNLOAD_TIMEOUT"
+        "--silent"
+    )
     local url="https://api.github.com/repos/${BEBOP_GITHUB_REPO}/releases/latest"
-    export LATEST_RELEASE_META="$(curl --connect-timeout 5 --silent --fail "$url" 2>/dev/null || true)"
+    export LATEST_RELEASE_META="$(curl "${curl_args[@]}" "$url" 2>/dev/null || true)"
     log_debug "Latest release metadata: $(echo "$LATEST_RELEASE_META" | jq -c .)"
     local filter='
         .assets[]
@@ -1244,19 +1286,27 @@ run_task() {
 configure_nodejs_repo() {
     log_info "Configuring Node.js repository..."
 
-    local NODE_MAJOR=22
+    local node_major="$NODEJS_MAJOR_VERSION"
     local TMPDIR=$(mktemp -d)
     # shellcheck disable=SC2064  # TMPDIR should be expanded here (and not on trap).
     trap "rm -rf $TMPDIR" RETURN 2>/dev/null || true
 
     # Download and add NodeSource GPG key
-    curl --connect-timeout 5 -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | \
+    local curl_args=(
+        "--connect-timeout" "$CURL_CONNECT_TIMEOUT"
+        "--fail"
+        "--location"
+        "--max-time" "$CURL_DOWNLOAD_TIMEOUT"
+        "--show-error"
+        "--silent"
+    )
+    curl "${curl_args[@]}" https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | \
         gpg --batch --yes --output "$TMPDIR/nodesource.gpg" --dearmor
 
     # Create repository configuration
     cat > "$TMPDIR/nodesource.list" << EOF
 # This file is managed by be-bop-wizard
-deb [signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main
+deb [signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${node_major}.x nodistro main
 EOF
 
     # Create package preferences
@@ -1279,33 +1329,29 @@ EOF
 configure_mongodb_repo() {
     log_info "Configuring MongoDB repository..."
 
-    if [[ ! -f /etc/os-release ]]; then
-        die $EXIT_FATAL "Cannot determine OS version"
-    fi
-
-    source /etc/os-release
-    local RELEASE="$VERSION_CODENAME"
-    local DISTRIBUTION="$ID"
+    local distribution="$DETECTED_OS"
+    local release="$DETECTED_VERSION"
+    log_debug "Installing mongodb repository for ${distribution} ${release}"
 
     # Determine archive component
-    case "$DISTRIBUTION" in
+    case "$distribution" in
         ubuntu)
-            local ARCHIVE="multiverse"
+            local archive="multiverse"
             ;;
         debian)
-            local ARCHIVE="main"
+            local archive="main"
             ;;
         *)
-            die $EXIT_FATAL "Unsupported distribution: ${DISTRIBUTION}"
+            die $EXIT_FATAL "Unsupported distribution: ${distribution}"
             ;;
     esac
 
     # Validate supported releases
-    case "$DISTRIBUTION-$RELEASE" in
+    case "$distribution-$release" in
         ubuntu-noble|ubuntu-jammy|ubuntu-focal|debian-bookworm)
             ;;
         *)
-            die $EXIT_FATAL "Unsupported release: ${DISTRIBUTION} ${RELEASE}"
+            die $EXIT_FATAL "Unsupported release: ${distribution} ${release}"
             ;;
     esac
 
@@ -1314,18 +1360,26 @@ configure_mongodb_repo() {
     trap "rm -rf $TMPDIR" RETURN 2>/dev/null || true
 
     # Download and add MongoDB GPG key
-    curl --connect-timeout 5 -fsSL https://www.mongodb.org/static/pgp/server-8.0.asc | \
+    local curl_args=(
+        "--connect-timeout" "$CURL_CONNECT_TIMEOUT"
+        "--fail"
+        "--location"
+        "--max-time" "$CURL_DOWNLOAD_TIMEOUT"
+        "--show-error"
+        "--silent"
+    )
+    curl "${curl_args[@]}" https://www.mongodb.org/static/pgp/server-8.0.asc | \
         gpg --batch --yes --output "$TMPDIR/mongodb-server-8.0.gpg" --dearmor
 
     # Create repository configuration
     cat > "$TMPDIR/mongodb-org-8.0.list" << EOF
 # This file is managed by be-bop-wizard
-deb [arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/${DISTRIBUTION} ${RELEASE}/mongodb-org/8.0 ${ARCHIVE}
+deb [arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/${distribution} ${release}/mongodb-org/${MONGODB_VERSION} ${archive}
 EOF
 
     # Install configuration files using ucf
     ucf_install "$TMPDIR/mongodb-server-8.0.gpg" /usr/share/keyrings/mongodb-server-8.0.gpg
-    ucf_install "$TMPDIR/mongodb-org-8.0.list" /etc/apt/sources.list.d/mongodb-org-8.0.list
+    ucf_install "$TMPDIR/mongodb-org-8.0.list" /etc/apt/sources.list.d/mongodb-org-${MONGODB_VERSION}.list
 
     # Cleanup
     rm -rf "$TMPDIR"
@@ -1353,13 +1407,13 @@ start_and_enable_mongodb() {
 initialize_mongodb_rs() {
     log_info "Initializing MongoDB replica set..."
     # Wait for MongoDB to be ready
-    local retries=10
+    local retries="$SERVICE_TEST_START_RETRIES"
     while ! mongosh --quiet --eval "db.adminCommand('ping')" >/dev/null 2>&1; do
         if [[ $retries -le 0 ]]; then
             die $EXIT_ERROR "MongoDB failed to start after 30 seconds"
         fi
         log_debug "Waiting for MongoDB to be ready... ($retries retries left)"
-        sleep 3
+        sleep "$SERVICE_TEST_START_WAIT_SECONDS"
         ((retries--))
     done
 
@@ -1370,13 +1424,13 @@ initialize_mongodb_rs() {
     run_privileged systemctl restart mongod
 
     # Wait again after restart
-    retries=10
+    retries="$SERVICE_TEST_START_RETRIES"
     while ! mongosh --quiet --eval "db.adminCommand('ping')" >/dev/null 2>&1; do
         if [[ $retries -le 0 ]]; then
             die $EXIT_ERROR "MongoDB failed to restart after replica set initialization"
         fi
         log_debug "Waiting for MongoDB to be ready after restart... ($retries retries left)"
-        sleep 3
+        sleep "$SERVICE_TEST_START_WAIT_SECONDS"
         ((retries--))
     done
 }
@@ -1555,7 +1609,6 @@ provision_ssl_cert() {
 install_phoenixd() {
     log_info "Installing phoenixd Lightning Network daemon..."
 
-    local PHOENIXD_VERSION="0.6.2"
     local STOW_DIR="/usr/local/phoenixd"
     local PACKAGE_DIR="$STOW_DIR/phoenixd-${PHOENIXD_VERSION}"
 
@@ -1570,9 +1623,18 @@ install_phoenixd() {
         pushd "$TEMP_DIR" > /dev/null
 
         # Download and extract phoenixd
-        local PHOENIXD_URL="https://github.com/ACINQ/phoenixd/releases/download/v${PHOENIXD_VERSION}/phoenixd-${PHOENIXD_VERSION}-linux-x64.zip"
-        log_info "Downloading phoenixd ${PHOENIXD_VERSION} from ${PHOENIXD_URL}"
-        curl --connect-timeout 5 -fSL# "$PHOENIXD_URL" -o phoenixd.zip -m 300
+        local phoenixd_url="https://github.com/ACINQ/phoenixd/releases/download/v${PHOENIXD_VERSION}/phoenixd-${PHOENIXD_VERSION}-linux-x64.zip"
+        log_info "Downloading phoenixd ${PHOENIXD_VERSION} from ${phoenixd_url}"
+        local curl_args=(
+            "--connect-timeout" "$CURL_CONNECT_TIMEOUT"
+            "--fail"
+            "--location"
+            "--max-time" "$CURL_DOWNLOAD_TIMEOUT"
+            "--progress-bar"
+            "--show-error"
+            "--output" phoenixd.zip
+        )
+        curl "${curl_args[@]}" "$phoenixd_url"
         unzip -q phoenixd.zip
 
         # Create stow directory structure
@@ -1596,7 +1658,6 @@ install_phoenixd() {
 install_minio() {
     log_info "Installing MinIO object storage server..."
 
-    local MINIO_VERSION="RELEASE.2025-09-07T16-13-09Z"
     local STOW_DIR="/usr/local/minio"
     local PACKAGE_DIR="$STOW_DIR/minio-${MINIO_VERSION}"
 
@@ -1613,7 +1674,16 @@ install_minio() {
         # Download MinIO binary
         local MINIO_URL="https://dl.min.io/server/minio/release/linux-amd64/archive/minio.${MINIO_VERSION}"
         log_info "Downloading MinIO ${MINIO_VERSION} from ${MINIO_URL}"
-        curl --connect-timeout 5 -fSL# "$MINIO_URL" -o minio -m 300
+        local curl_args=(
+            "--connect-timeout" "$CURL_CONNECT_TIMEOUT"
+            "--fail"
+            "--location"
+            "--max-time" "$CURL_DOWNLOAD_TIMEOUT"
+            "--progress-bar"
+            "--show-error"
+            "--output" minio
+        )
+        curl "${curl_args[@]}" "$MINIO_URL"
 
         # Create stow directory structure
         run_privileged mkdir -p "$PACKAGE_DIR/bin"
@@ -2068,7 +2138,16 @@ Please check your internet connection and try again at a later time."
         fi
 
         log_info "Downloading ${LATEST_RELEASE_ASSET_BASENAME} from ${LATEST_RELEASE_URL}"
-        curl --connect-timeout 5 -fSL# "$LATEST_RELEASE_URL" -o be-BOP-latest.zip -m 300
+        local curl_args=(
+            "--connect-timeout" "$CURL_CONNECT_TIMEOUT"
+            "--fail"
+            "--location"
+            "--max-time" "$CURL_DOWNLOAD_TIMEOUT"
+            "--progress-bar"
+            "--show-error"
+            "--output" "be-BOP-latest.zip"
+        )
+        curl "${curl_args[@]}" "$LATEST_RELEASE_URL"
         unzip -q be-BOP-latest.zip
 
         local EXTRACTED_DIR=$(find . -maxdepth 1 -type d -name "be-BOP release *" | head -1)
