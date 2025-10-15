@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.1.2"
+readonly SCRIPT_VERSION="2.1.3"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -57,6 +57,7 @@ readonly BEBOP_GITHUB_REPO="${BEBOP_GITHUB_REPO:-be-BOP-io-SA/be-BOP}"
 readonly EXIT_SUCCESS=0
 readonly EXIT_ERROR=1
 readonly EXIT_FATAL=2
+readonly EXIT_USER_ABORT=3
 
 # Network and timeout constants
 readonly CURL_CONNECT_TIMEOUT=${CURL_CONNECT_TIMEOUT:-5}
@@ -173,9 +174,84 @@ log_debug() {
 # Error handling
 die() {
     local exit_code=${1:-$EXIT_ERROR}
-    shift
-    log_error "$@"
+    local line_number=${2:-}
+    shift 2
+    local message="$*"
+    script_name="$(basename "${BASH_SOURCE[1]:-${0:-be-bop-wizard}}")"
+    log_error "Error in ${script_name}${line_number:+ at line $line_number}: $message"
+    log_error "The script paused to prevent any potential issues."
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "💡 The wizard stopped safely after an error."
+    echo ""
+    echo "🧩 Details:"
+    echo "   • Error: $message"
+    if [[ -n "$line_number" ]]; then
+        echo "   • Location: ${script_name}:${line_number}"
+    fi
+    echo "   • Wizard version: $SCRIPT_VERSION"
+    echo ""
+    echo "✓ No unsafe system changes were made"
+    echo "✓ It’s safe to re-run the wizard once the issue is fixed"
+    echo ""
+    if ! [[ "${FULL_CMD_LINE[*]}" =~ "--verbose" ]]; then
+        echo "If you’d like to investigate or get help, re-run with --verbose to get detailed output:"
+        echo "  $(basename "${0:-be-bop-wizard}") ${FULL_CMD_LINE[*]} --verbose"
+        echo ""
+        echo "Be kind to your terminal — it’s doing its best. 🧡"
+    else
+        echo "If you need assistance resolving this issue, please share the full command output with us."
+        echo ""
+        echo "🪪 Contact options:"
+        echo "    - Email: contact@be-bop.io"
+        echo "    - Nostr: npub16l9pnrkhhagkucjhxvvztz2czv9ex8s5u7yg80ghw9ccjp4j25pqaku4ha"
+        echo ""
+        echo "📡 Follow updates and tooling improvements at:"
+        echo "    → https://be-bop.io/release-note"
+        echo ""
+        echo "Thank you for helping us make things better — and for being a friendly human. 🤝"
+    fi
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     exit "$exit_code"
+}
+
+die_missing_option_argument() {
+    local option="$1"
+    log_error "Option '$option' requires an argument but none was provided."
+    log_error "The script paused to prevent any potential issues."
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "💡 The option '$option' requires an argument but none was provided."
+    echo ""
+    echo "Example:"
+    echo "   $(basename "${0:-be-bop-wizard}") $option <value>"
+    echo ""
+    echo "✓ No unsafe system changes were made"
+    echo "✓ You can safely re-run the wizard once the command is corrected"
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    exit "$EXIT_USER_ABORT"
+}
+
+die_user_abort() {
+    local line_number="$1"
+    script_name="$(basename "${BASH_SOURCE[1]:-${0:-be-bop-wizard}}")"
+    if [[ -n "$line_number" ]]; then
+        log_warn "Operation at ${script_name}:${line_number} aborted by user."
+    else
+        log_warn "Operation aborted by user."
+    fi
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "💡 Operation cancelled"
+    echo ""
+    echo "You chose not to proceed — no changes were made to your system."
+    echo ""
+    echo "✓ No unsafe system changes were made"
+    echo "✓ You can safely re-run the wizard at a later time"
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    exit "$EXIT_USER_ABORT"
 }
 
 # Sudo wrapper for consistent privilege handling
@@ -193,11 +269,11 @@ install_file() {
     local destination="$2"
 
     if [[ -z "$source" || -z "$destination" ]]; then
-        die $EXIT_ERROR "Missing source or destination file"
+        die $EXIT_ERROR $LINENO "Missing source or destination file"
     elif [[ ! -f "$source" ]]; then
-        die $EXIT_ERROR "Source file '$source' does not exist"
+        die $EXIT_ERROR $LINENO "Source file '$source' does not exist"
     elif [[ "$source" = "$destination" ]]; then
-        die $EXIT_ERROR "Source and destination files are the same: $source"
+        die $EXIT_ERROR $LINENO "Source and destination files are the same: $source"
     fi
 
     if has_tool ucf; then
@@ -216,7 +292,7 @@ install_file() {
             # If install is not available, we have to manually remove the file
             # and then write the new file.
             if ! rm -fr "$destination"; then
-                die $EXIT_ERROR "Failed to install $source: Failed to remove $destination"
+                die $EXIT_ERROR $LINENO "Failed to install $source: Failed to remove $destination"
             fi
             run_privileged cp "$source" "$destination"
         fi
@@ -269,8 +345,11 @@ parse_args() {
                 shift
                 ;;
             --domain)
+                if [[ $# -lt 2 ]]; then
+                    die_missing_option_argument "--domain"
+                fi
                 export DOMAIN="$2"
-                FULL_CMD_LINE+=("$2")
+                FULL_CMD_LINE+=("$DOMAIN")
                 shift 2
                 ;;
             --dry-run)
@@ -278,8 +357,11 @@ parse_args() {
                 shift
                 ;;
             --email)
+                if [[ $# -lt 2 ]]; then
+                    die_missing_option_argument "--email"
+                fi
                 export EMAIL="$2"
-                FULL_CMD_LINE+=("$2")
+                FULL_CMD_LINE+=("$EMAIL")
                 shift 2
                 ;;
             --help|-h)
@@ -295,7 +377,7 @@ parse_args() {
                 shift
                 ;;
             *)
-                die $EXIT_ERROR "Unknown option: $1. Use --help for usage information."
+                die $EXIT_ERROR $LINENO "Unknown option: $1. Use --help for usage information."
                 ;;
         esac
     done
@@ -304,16 +386,16 @@ parse_args() {
     if [[ -n "${DOMAIN:-}" ]]; then
         if ! echo "$DOMAIN" | grep -qE '^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$'; then
             if [[ "$DOMAIN" != "localhost" ]]; then
-                die $EXIT_ERROR "Invalid domain format: $DOMAIN"
+                die $EXIT_ERROR $LINENO "Invalid domain format: $DOMAIN"
             fi
         fi
         if [[ ${#DOMAIN} -gt 253 ]]; then
-            die $EXIT_ERROR "Domain too long (max 253 chars): $DOMAIN"
+            die $EXIT_ERROR $LINENO "Domain too long (max 253 chars): $DOMAIN"
         fi
         IFS='.' read -ra LABELS <<< "$DOMAIN"
         for label in "${LABELS[@]}"; do
             if [[ ${#label} -gt 63 ]]; then
-                die $EXIT_ERROR "Domain label too long (max 63 chars): $label"
+                die $EXIT_ERROR $LINENO "Domain label too long (max 63 chars): $label"
             fi
         done
     fi
@@ -321,7 +403,7 @@ parse_args() {
     # Basic email validation
     if [[ -n "${EMAIL:-}" ]]; then
         if ! echo "$EMAIL" | grep -qE '^[^@]+@[^@]+\.[^@]+$'; then
-            die $EXIT_ERROR "Invalid email format: $EMAIL"
+            die $EXIT_ERROR $LINENO "Invalid email format: $EMAIL"
         fi
     fi
 }
@@ -357,13 +439,13 @@ check_privileges() {
                 log_warn "Are you sure you want to continue?"
                 read -rp "Type 'proceed' to continue: " response
                 if [[ "$response" != "proceed" ]]; then
-                    die $EXIT_ERROR "Operation aborted."
+                    die_user_abort $LINENO
                 fi
                 export RUNNING_AS_ROOT=true
             else
                 log_warn "Running as root is not recommended."
                 log_warn "If you must run as root, use --allow-root flag."
-                die $EXIT_ERROR "Use --allow-root if you really need to run as root, or run as a regular user."
+                die $EXIT_ERROR $LINENO "Running as root is discouraged. Use --allow-root if you really need to run as root, or run as a regular user."
             fi
         else
             log_warn "Running as root. sudo commands will be skipped."
@@ -380,7 +462,7 @@ check_privileges() {
 
             # Test sudo access
             if ! command -v sudo &>/dev/null; then
-                die $EXIT_ERROR "sudo access is required. Please ensure your user has sudo privileges."
+                die $EXIT_ERROR $LINENO "sudo access is required. Please ensure your user has sudo privileges."
             fi
         fi
     fi
@@ -392,7 +474,7 @@ detect_environment() {
 
     # Check OS
     if [[ ! -f /etc/os-release ]]; then
-        die $EXIT_FATAL "/etc/os-release not found. Unsupported system."
+        die $EXIT_FATAL $LINENO "/etc/os-release not found. Unsupported system."
     fi
 
     source /etc/os-release
@@ -400,17 +482,17 @@ detect_environment() {
 
     # Check if Debian-based
     if [[ "$ID" != "debian" && "$ID" != "ubuntu" ]]; then
-        die $EXIT_FATAL "Unsupported OS: $ID. This script requires Debian or Ubuntu."
+        die $EXIT_FATAL $LINENO "Unsupported OS: $ID. This script requires Debian or Ubuntu."
     fi
 
     # Check package manager
     if ! command -v apt >/dev/null 2>&1; then
-        die $EXIT_FATAL "apt package manager not found. This script requires Debian/Ubuntu with apt."
+        die $EXIT_FATAL $LINENO "apt package manager not found. This script requires Debian/Ubuntu with apt."
     fi
 
     # Check systemd available
     if ! command -v systemctl &>/dev/null; then
-        die $EXIT_FATAL "systemd not found. This script requires systemd."
+        die $EXIT_FATAL $LINENO "systemd not found. This script requires systemd."
     fi
 
     # Detect container environment
@@ -1305,7 +1387,7 @@ run_task() {
         "start_and_enable_phoenixd") start_and_enable_phoenixd ;;
         "write_bebop_configuration") write_bebop_configuration ;;
         "write_minio_configuration") write_minio_configuration ;;
-        *) die $EXIT_ERROR "Unknown action: $1" ;;
+        *) die $EXIT_ERROR $LINENO "Unable to execute task: $1" ;;
     esac
 }
 
@@ -1367,7 +1449,7 @@ configure_mongodb_repo() {
             local archive="main"
             ;;
         *)
-            die $EXIT_FATAL "Unsupported distribution: ${distribution}"
+            die $EXIT_FATAL $LINENO "Unsupported distribution: ${distribution}"
             ;;
     esac
 
@@ -1376,7 +1458,7 @@ configure_mongodb_repo() {
         ubuntu-noble|ubuntu-jammy|ubuntu-focal|debian-bookworm)
             ;;
         *)
-            die $EXIT_FATAL "Unsupported release: ${distribution} ${release}"
+            die $EXIT_FATAL $LINENO "Unsupported release: ${distribution} ${release}"
             ;;
     esac
 
@@ -1434,7 +1516,7 @@ initialize_mongodb_rs() {
     local retries="$SERVICE_TEST_START_RETRIES"
     while ! mongosh --quiet --eval "db.adminCommand('ping')" >/dev/null 2>&1; do
         if [[ $retries -le 0 ]]; then
-            die $EXIT_ERROR "MongoDB failed to start after 30 seconds"
+            die $EXIT_ERROR $LINENO "MongoDB failed to start after 30 seconds"
         fi
         log_debug "Waiting for MongoDB to be ready... ($retries retries left)"
         sleep "$SERVICE_TEST_START_WAIT_SECONDS"
@@ -1451,7 +1533,7 @@ initialize_mongodb_rs() {
     retries="$SERVICE_TEST_START_RETRIES"
     while ! mongosh --quiet --eval "db.adminCommand('ping')" >/dev/null 2>&1; do
         if [[ $retries -le 0 ]]; then
-            die $EXIT_ERROR "MongoDB failed to restart after replica set initialization"
+            die $EXIT_ERROR $LINENO "MongoDB failed to restart after replica set initialization"
         fi
         log_debug "Waiting for MongoDB to be ready after restart... ($retries retries left)"
         sleep "$SERVICE_TEST_START_WAIT_SECONDS"
@@ -1603,7 +1685,7 @@ EOF
 
     # Test nginx configuration
     if ! run_privileged nginx -t; then
-        die $EXIT_ERROR "nginx configuration test failed"
+        die $EXIT_ERROR $LINENO "nginx configuration test failed"
     fi
 
     # Cleanup
@@ -1771,7 +1853,7 @@ write_bebop_configuration() {
     local S3_ROOT_PASSWORD=$(run_privileged grep '^MINIO_ROOT_PASSWORD=' /etc/minio/config.env 2>/dev/null | cut -d'=' -f2- || echo "")
 
     if [[ -z "$S3_ROOT_USER" ]] || [[ -z "$S3_ROOT_PASSWORD" ]]; then
-        die $EXIT_ERROR "Could not find MinIO credentials in /etc/minio/config.env"
+        die $EXIT_ERROR $LINENO "Could not find MinIO credentials in /etc/minio/config.env"
     fi
 
     local TMPDIR=$(mktemp -d)
@@ -2134,7 +2216,7 @@ I will skip the current step, leave the existing installation intact, and contin
 Please check your internet connection and try again at a later time."
             return 0
         else
-            die $EXIT_ERROR "Unable to retrieve latest be-BOP release information"
+            die $EXIT_ERROR $LINENO "Unable to retrieve latest be-BOP release information"
         fi
     fi
 
@@ -2152,7 +2234,7 @@ Please check your internet connection and try again at a later time."
         local LATEST_RELEASE_URL=$(echo "$LATEST_RELEASE_META" | jq -r "$filter")
 
         if [[ -z "$LATEST_RELEASE_URL" || "$LATEST_RELEASE_URL" = "null" ]]; then
-            die $EXIT_ERROR "Could not find latest be-BOP release URL"
+            die $EXIT_ERROR $LINENO "Could not find latest be-BOP release URL"
         fi
 
         log_info "Downloading ${LATEST_RELEASE_ASSET_BASENAME} from ${LATEST_RELEASE_URL}"
@@ -2170,7 +2252,7 @@ Please check your internet connection and try again at a later time."
 
         local EXTRACTED_DIR=$(find . -maxdepth 1 -type d -name "be-BOP release *" | head -1)
         if [[ -z "$EXTRACTED_DIR" ]]; then
-            die $EXIT_ERROR "Could not find extracted directory for be-BOP release"
+            die $EXIT_ERROR $LINENO "Could not find extracted directory for be-BOP release"
         fi
 
         if [[ -d "$TARGET_DIR" ]]; then
@@ -2198,7 +2280,7 @@ Please check your internet connection and try again at a later time."
     if [[ -L /var/lib/be-BOP/releases/current ]]; then
         run_privileged rm -f /var/lib/be-BOP/releases/current
     elif [[ -e /var/lib/be-BOP/releases/current ]]; then
-        die $EXIT_ERROR "Something unknown is blocking the creation of /var/lib/be-BOP/releases/current symlink. Please check what exists at this path and remove it manually."
+        die $EXIT_ERROR $LINENO "Something unknown is blocking the creation of /var/lib/be-BOP/releases/current symlink. Please check what exists at this path and remove it manually."
     fi
     run_privileged ln -sf "$TARGET_DIR" /var/lib/be-BOP/releases/current
 }
