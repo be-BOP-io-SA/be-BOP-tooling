@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.2.4"
+readonly SCRIPT_VERSION="2.3.0"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -525,7 +525,7 @@ bebop_config_wizard_fingerprint() {
     # file change, so that different template generations can be distinguished
     # programmatically.
     # The value is currently internal, but may be exposed in the future.
-    local template_rev="2025101601"
+    local template_rev="2025101602"
     if command -v sha256sum >/dev/null 2>&1; then
         printf 'sha256:%s\n' "$(printf '%s' "$template_rev" | sha256sum | awk '{print $1}')"
     elif command -v sha256 >/dev/null 2>&1; then
@@ -2067,11 +2067,12 @@ write_bebop_configuration() {
     log_info "Generating be-BOP environment configuration..."
     local domain="$(get_fact "specified_domain")"
 
-    # Read MinIO credentials from config file
-    local S3_ROOT_USER=$(run_privileged grep '^MINIO_ROOT_USER=' /etc/minio/config.env 2>/dev/null | cut -d'=' -f2- || echo "")
-    local S3_ROOT_PASSWORD=$(run_privileged grep '^MINIO_ROOT_PASSWORD=' /etc/minio/config.env 2>/dev/null | cut -d'=' -f2- || echo "")
+    # Read various secrets to embed into the configuration file.
+    local s3_root_user="$(run_privileged grep '^MINIO_ROOT_USER=' /etc/minio/config.env 2>/dev/null | cut -d'=' -f2- || echo "")"
+    local s3_root_password="$(run_privileged grep '^MINIO_ROOT_PASSWORD=' /etc/minio/config.env 2>/dev/null | cut -d'=' -f2- || echo "")"
+    local phoenixd_http_password="$(run_privileged grep -oP 'http-password=\K[^ ]+' /var/lib/phoenixd/.phoenix/phoenix.conf)"
 
-    if [[ -z "$S3_ROOT_USER" ]] || [[ -z "$S3_ROOT_PASSWORD" ]]; then
+    if [[ -z "$s3_root_user" ]] || [[ -z "$s3_root_password" ]]; then
         die $EXIT_ERROR $LINENO "Could not find MinIO credentials in /etc/minio/config.env"
     fi
 
@@ -2090,10 +2091,12 @@ MONGODB_DB=bebop
 MONGODB_URL=mongodb://127.0.0.1:27017
 ORIGIN=https://${domain}
 PUBLIC_S3_ENDPOINT_URL=https://s3.${domain}
+PHOENIXD_ENDPOINT_URL=http://127.0.0.1:9740
+PHOENIXD_HTTP_PASSWORD=${phoenixd_http_password}
 S3_BUCKET=bebop
 S3_ENDPOINT_URL=http://127.0.0.1:9000
-S3_KEY_ID=${S3_ROOT_USER}
-S3_KEY_SECRET=${S3_ROOT_PASSWORD}
+S3_KEY_ID=${s3_root_user}
+S3_KEY_SECRET=${s3_root_password}
 S3_REGION=localhost
 XFF_DEPTH=1
 EOF
