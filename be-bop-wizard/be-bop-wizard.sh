@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.1.0"
+readonly SCRIPT_VERSION="2.2.2"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -56,7 +56,27 @@ readonly BEBOP_GITHUB_REPO="${BEBOP_GITHUB_REPO:-be-BOP-io-SA/be-BOP}"
 # Exit codes
 readonly EXIT_SUCCESS=0
 readonly EXIT_ERROR=1
-readonly EXIT_FATAL=2
+readonly EXIT_INCOMPATIBLE_SYSTEM_STATE=2
+readonly EXIT_USER_ABORT=3
+
+# Network and timeout constants
+readonly CURL_CONNECT_TIMEOUT=${CURL_CONNECT_TIMEOUT:-5}
+readonly CURL_DOWNLOAD_TIMEOUT=${CURL_DOWNLOAD_TIMEOUT:-300}
+readonly SERVICE_TEST_START_RETRIES=10
+readonly SERVICE_TEST_START_WAIT_SECONDS=3
+
+# Software versions
+# WARNING: Do not simply change these version numbers without careful consideration!
+# Changing versions may require updating installation scripts, configuration templates,
+# compatibility checks, and cleanup procedures for existing installations.
+# On each version change the logic for provisioning the version be reviewed to install
+# and prefer the newer version, possibly remove the previous version while keeping the
+# script “safe”: For example, the previous version repositories can only be removed if
+# a newer version is already installed.
+readonly NODEJS_MAJOR_VERSION=22
+readonly MONGODB_VERSION="8.0"
+readonly PHOENIXD_VERSION="0.6.2"
+readonly MINIO_VERSION="RELEASE.2025-09-07T16-13-09Z"
 
 # Error trap handler
 handle_error() {
@@ -154,9 +174,84 @@ log_debug() {
 # Error handling
 die() {
     local exit_code=${1:-$EXIT_ERROR}
-    shift
-    log_error "$@"
+    local line_number=${2:-}
+    shift 2
+    local message="$*"
+    script_name="$(basename "${BASH_SOURCE[1]:-${0:-be-bop-wizard}}")"
+    log_error "Error in ${script_name}${line_number:+ at line $line_number}: $message"
+    log_error "The script paused to prevent any potential issues."
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "💡 The wizard stopped safely after an error."
+    echo ""
+    echo "🧩 Details:"
+    echo "   • Error: $message"
+    if [[ -n "$line_number" ]]; then
+        echo "   • Location: ${script_name}:${line_number}"
+    fi
+    echo "   • Wizard version: $SCRIPT_VERSION"
+    echo ""
+    echo "✓ No unsafe system changes were made"
+    echo "✓ It’s safe to re-run the wizard once the issue is fixed"
+    echo ""
+    if ! [[ "${FULL_CMD_LINE[*]}" =~ "--verbose" ]]; then
+        echo "If you’d like to investigate or get help, re-run with --verbose to get detailed output:"
+        echo "  $(basename "${0:-be-bop-wizard}") ${FULL_CMD_LINE[*]} --verbose"
+        echo ""
+        echo "Be kind to your terminal — it’s doing its best. 🧡"
+    else
+        echo "If you need assistance resolving this issue, please share the full command output with us."
+        echo ""
+        echo "🪪 Contact options:"
+        echo "    - Email: contact@be-bop.io"
+        echo "    - Nostr: npub16l9pnrkhhagkucjhxvvztz2czv9ex8s5u7yg80ghw9ccjp4j25pqaku4ha"
+        echo ""
+        echo "📡 Follow updates and tooling improvements at:"
+        echo "    → https://be-bop.io/release-note"
+        echo ""
+        echo "Thank you for helping us make things better — and for being a friendly human. 🤝"
+    fi
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     exit "$exit_code"
+}
+
+die_missing_option_argument() {
+    local option="$1"
+    log_error "Option '$option' requires an argument but none was provided."
+    log_error "The script paused to prevent any potential issues."
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "💡 The option '$option' requires an argument but none was provided."
+    echo ""
+    echo "Example:"
+    echo "   $(basename "${0:-be-bop-wizard}") $option <value>"
+    echo ""
+    echo "✓ No unsafe system changes were made"
+    echo "✓ You can safely re-run the wizard once the command is corrected"
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    exit "$EXIT_USER_ABORT"
+}
+
+die_user_abort() {
+    local line_number="$1"
+    script_name="$(basename "${BASH_SOURCE[1]:-${0:-be-bop-wizard}}")"
+    if [[ -n "$line_number" ]]; then
+        log_warn "Operation at ${script_name}:${line_number} aborted by user."
+    else
+        log_warn "Operation aborted by user."
+    fi
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "💡 Operation cancelled"
+    echo ""
+    echo "You chose not to proceed — no changes were made to your system."
+    echo ""
+    echo "✓ No unsafe system changes were made"
+    echo "✓ You can safely re-run the wizard at a later time"
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    exit "$EXIT_USER_ABORT"
 }
 
 # Sudo wrapper for consistent privilege handling
@@ -168,14 +263,40 @@ run_privileged() {
     fi
 }
 
-# ucf wrapper for consistent file management
-ucf_install() {
-    # If the file does not exist and, purge it from the ucf database in case
-    # the user removed it.
-    if [[ ! -f "$2" && -f /var/lib/ucf/hashfile ]]; then
-        run_privileged ucf --purge "$2" || true
+# Wrapper for consistent file management
+install_file() {
+    local source="$1"
+    local destination="$2"
+
+    if [[ -z "$source" || -z "$destination" ]]; then
+        die $EXIT_ERROR $LINENO "Missing source or destination file"
+    elif [[ ! -f "$source" ]]; then
+        die $EXIT_ERROR $LINENO "Source file '$source' does not exist"
+    elif [[ "$source" = "$destination" ]]; then
+        die $EXIT_ERROR $LINENO "Source and destination files are the same: $source"
     fi
-    run_privileged ucf "$1" "$2"
+
+    if has_tool ucf; then
+        # If the file does not exist and, purge it from the ucf database in
+        # case the user removed it.
+        if [[ ! -f "$destination" && -f /var/lib/ucf/hashfile ]]; then
+            run_privileged ucf --purge "$2" || true
+        fi
+        run_privileged ucf "$1" "$2"
+    else
+        # If ucf is not available, prefer install since it will atomically
+        # replace the file.
+        if has_tool install; then
+            run_privileged install "$source" "$destination"
+        else
+            # If install is not available, we have to manually remove the file
+            # and then write the new file.
+            if ! rm -fr "$destination"; then
+                die $EXIT_ERROR $LINENO "Failed to install $source: Failed to remove $destination"
+            fi
+            run_privileged cp "$source" "$destination"
+        fi
+    fi
 }
 
 # Show usage information
@@ -224,8 +345,11 @@ parse_args() {
                 shift
                 ;;
             --domain)
+                if [[ $# -lt 2 ]]; then
+                    die_missing_option_argument "--domain"
+                fi
                 export DOMAIN="$2"
-                FULL_CMD_LINE+=("$2")
+                FULL_CMD_LINE+=("$DOMAIN")
                 shift 2
                 ;;
             --dry-run)
@@ -233,8 +357,11 @@ parse_args() {
                 shift
                 ;;
             --email)
+                if [[ $# -lt 2 ]]; then
+                    die_missing_option_argument "--email"
+                fi
                 export EMAIL="$2"
-                FULL_CMD_LINE+=("$2")
+                FULL_CMD_LINE+=("$EMAIL")
                 shift 2
                 ;;
             --help|-h)
@@ -250,7 +377,7 @@ parse_args() {
                 shift
                 ;;
             *)
-                die $EXIT_ERROR "Unknown option: $1. Use --help for usage information."
+                die $EXIT_ERROR $LINENO "Unknown option: $1. Use --help for usage information."
                 ;;
         esac
     done
@@ -259,16 +386,16 @@ parse_args() {
     if [[ -n "${DOMAIN:-}" ]]; then
         if ! echo "$DOMAIN" | grep -qE '^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$'; then
             if [[ "$DOMAIN" != "localhost" ]]; then
-                die $EXIT_ERROR "Invalid domain format: $DOMAIN"
+                die $EXIT_ERROR $LINENO "Invalid domain format: $DOMAIN"
             fi
         fi
         if [[ ${#DOMAIN} -gt 253 ]]; then
-            die $EXIT_ERROR "Domain too long (max 253 chars): $DOMAIN"
+            die $EXIT_ERROR $LINENO "Domain too long (max 253 chars): $DOMAIN"
         fi
         IFS='.' read -ra LABELS <<< "$DOMAIN"
         for label in "${LABELS[@]}"; do
             if [[ ${#label} -gt 63 ]]; then
-                die $EXIT_ERROR "Domain label too long (max 63 chars): $label"
+                die $EXIT_ERROR $LINENO "Domain label too long (max 63 chars): $label"
             fi
         done
     fi
@@ -276,7 +403,7 @@ parse_args() {
     # Basic email validation
     if [[ -n "${EMAIL:-}" ]]; then
         if ! echo "$EMAIL" | grep -qE '^[^@]+@[^@]+\.[^@]+$'; then
-            die $EXIT_ERROR "Invalid email format: $EMAIL"
+            die $EXIT_ERROR $LINENO "Invalid email format: $EMAIL"
         fi
     fi
 }
@@ -312,13 +439,13 @@ check_privileges() {
                 log_warn "Are you sure you want to continue?"
                 read -rp "Type 'proceed' to continue: " response
                 if [[ "$response" != "proceed" ]]; then
-                    die $EXIT_ERROR "Operation aborted."
+                    die_user_abort $LINENO
                 fi
                 export RUNNING_AS_ROOT=true
             else
                 log_warn "Running as root is not recommended."
                 log_warn "If you must run as root, use --allow-root flag."
-                die $EXIT_ERROR "Use --allow-root if you really need to run as root, or run as a regular user."
+                die $EXIT_ERROR $LINENO "Running as root is discouraged. Use --allow-root if you really need to run as root, or run as a regular user."
             fi
         else
             log_warn "Running as root. sudo commands will be skipped."
@@ -335,52 +462,62 @@ check_privileges() {
 
             # Test sudo access
             if ! command -v sudo &>/dev/null; then
-                die $EXIT_ERROR "sudo access is required. Please ensure your user has sudo privileges."
+                die $EXIT_ERROR $LINENO "sudo access is required. Please ensure your user has sudo privileges."
             fi
         fi
     fi
 }
 
-# Environment detection
-detect_environment() {
-    log_info "Detecting system environment..."
+detect_os_information() {
+    local id name release pretty
 
-    # Check OS
-    if [[ ! -f /etc/os-release ]]; then
-        die $EXIT_FATAL "/etc/os-release not found. Unsupported system."
+    if [ -r /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        id="${ID:-unknown}"
+        name="${NAME:-${ID:-Unknown}}"
+        release="${VERSION_CODENAME:-${VERSION_ID:-unknown}}"
+        pretty="${PRETTY_NAME:-${NAME} ${VERSION_ID}}"
+
+    elif command -v lsb_release >/dev/null 2>&1; then
+        id=$(lsb_release -si | tr '[:upper:]' '[:lower:]')
+        name=$(lsb_release -si)
+        release=$(lsb_release -sc)
+        pretty=$(lsb_release -sd | tr -d '"')
+
+    elif [ "$(uname -s)" = "FreeBSD" ]; then
+        id="freebsd"
+        name="FreeBSD"
+        release=$(freebsd-version | cut -d- -f1)
+        pretty="FreeBSD $(freebsd-version)"
+
+    else
+        id=$(uname -s | tr '[:upper:]' '[:lower:]')
+        name=$(uname -s)
+        release=$(uname -r)
+        pretty="$name $release"
     fi
 
-    source /etc/os-release
-    log_debug "Detected OS: $PRETTY_NAME"
+    export DETECTED_MACHINE_OS_NAME="$id"
+    export DETECTED_MACHINE_OS_RELEASE="$release"
+    export DETECTED_HUMAN_OS_DISTRIBUTION="$pretty"
+}
 
-    # Check if Debian-based
-    if [[ "$ID" != "debian" && "$ID" != "ubuntu" ]]; then
-        die $EXIT_FATAL "Unsupported OS: $ID. This script requires Debian or Ubuntu."
+is_systemd_operational() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        return 1
+    fi
+    if [ "$(ps -p 1 -o comm=)" != "systemd" ]; then
+        return 1
     fi
 
-    # Check package manager
-    if ! command -v apt >/dev/null 2>&1; then
-        die $EXIT_FATAL "apt package manager not found. This script requires Debian/Ubuntu with apt."
-    fi
+    local state
+    state=$(systemctl is-system-running 2>/dev/null || true)
 
-    # Check systemd available
-    if ! command -v systemctl &>/dev/null; then
-        die $EXIT_FATAL "systemd not found. This script requires systemd."
-    fi
-
-    # Detect container environment
-    local container_type="none"
-    if command -v systemd-detect-virt >/dev/null 2>&1; then
-        container_type=$(systemd-detect-virt --container 2>/dev/null || true)
-    fi
-
-    log_info "Environment: $PRETTY_NAME"
-    log_info "Container: $container_type"
-
-    # Store environment info in global variables for later use
-    export DETECTED_OS="$ID"
-    export DETECTED_VERSION="$VERSION_CODENAME"
-    export DETECTED_CONTAINER="$container_type"
+    case "$state" in
+        running|degraded) return 0 ;;  # good enough
+        *) return 1 ;;
+    esac
 }
 
 # ---[ 1. Inspect the system ]---
@@ -395,11 +532,6 @@ inspect_system_state() {
     # Initialize system facts array
     export SYSTEM_STATE=()
 
-    # Check if running in container
-    if [[ "$DETECTED_CONTAINER" != "none" ]]; then
-        SYSTEM_STATE+=("running_in_container")
-    fi
-
     if [[ -n "${DOMAIN:-}" ]]; then
         SYSTEM_STATE+=("specified_domain=${DOMAIN}")
     fi
@@ -408,20 +540,59 @@ inspect_system_state() {
         SYSTEM_STATE+=("specified_email=${EMAIL}")
     fi
 
+    detect_os_information
+    SYSTEM_STATE+=("os_name=${DETECTED_MACHINE_OS_NAME}")
+    SYSTEM_STATE+=("os_release=${DETECTED_MACHINE_OS_RELEASE}")
+
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        local container_type="none"
+        container_type=$(systemd-detect-virt --container 2>/dev/null || true)
+        if [[ "$container_type" != "none" ]]; then
+            SYSTEM_STATE+=("running_in_container")
+        fi
+    fi
+
     # Check what tools are available
+    local potential_commands=(
+        "apt"
+        "curl"
+        "gpg"
+        "install"
+        "jq"
+        "mongosh"
+        "openssl"
+        "stow"
+        "ucf"
+        "unzip"
+    )
     export AVAILABLE_TOOLS=()
-    local potential_commands=("curl" "gpg" "jq" "openssl" "stow" "unzip")
     for cmd in "${potential_commands[@]}"; do
         if command -v "$cmd" >/dev/null 2>&1; then
             AVAILABLE_TOOLS+=("$cmd")
         fi
     done
-    local potential_packages=("certbot" "nginx" "python3-certbot-nginx" "ssl-cert")
-    for pkg in "${potential_packages[@]}"; do
-        if dpkg -s "$pkg" >/dev/null 2>&1; then
-            AVAILABLE_TOOLS+=("$pkg")
-        fi
-    done
+    local potential_packages=(
+        "certbot"
+        "mongodb-org"
+        "nginx"
+        "python3-certbot-nginx"
+        "ssl-cert"
+    )
+    if command -v dpkg >/dev/null 2>&1; then
+        for pkg in "${potential_packages[@]}"; do
+            if dpkg -s "$pkg" >/dev/null 2>&1; then
+                AVAILABLE_TOOLS+=("$pkg")
+            fi
+        done
+    fi
+
+    # Check if systemd is operational
+    if is_systemd_operational; then
+        SYSTEM_STATE+=("systemd_operational")
+    fi
+    if has_fact systemd_operational && command -v systemctl >/dev/null 2>&1; then
+        AVAILABLE_TOOLS+=("systemctl")
+    fi
 
     log_debug "Available tools: ${AVAILABLE_TOOLS[*]}"
 
@@ -441,32 +612,29 @@ inspect_system_state() {
         SYSTEM_STATE+=("pnpm_available")
     fi
 
-    if [[ -f /etc/apt/sources.list.d/mongodb-org-8.0.list ]]; then
+    if [[ -f /etc/apt/sources.list.d/mongodb-org-${MONGODB_VERSION}.list ]]; then
         SYSTEM_STATE+=("mongodb_repo_configured")
     fi
 
-    if dpkg -s mongodb-org >/dev/null 2>&1; then
+    if has_tool mongodb-org >/dev/null 2>&1; then
         SYSTEM_STATE+=("mongodb_installed")
     fi
 
-    if systemctl is-active --quiet mongod 2>/dev/null; then
+    if has_tool systemctl && systemctl is-active --quiet mongod 2>/dev/null || \
+        has_tool mongosh && mongosh --quiet --eval "db.adminCommand('ping')" >/dev/null 2>&1; then
         SYSTEM_STATE+=("mongodb_running")
     fi
 
-    if command -v mongosh >/dev/null && mongosh --quiet --eval "rs.status().ok" 2>/dev/null | grep -q "1"; then
+    if has_tool mongosh && mongosh --quiet --eval "rs.status().ok" 2>/dev/null | grep -q "1"; then
         SYSTEM_STATE+=("mongodb_rs_initialized")
     fi
 
-    if command -v nginx >/dev/null 2>&1; then
-        SYSTEM_STATE+=("nginx_installed")
-    fi
-
-    if systemctl is-active --quiet nginx 2>/dev/null; then
+    if has_tool systemctl && systemctl is-active --quiet nginx 2>/dev/null; then
         SYSTEM_STATE+=("nginx_running")
     fi
 
     # Check SSL certificate availability (check package instead of private key due to permissions)
-    if dpkg -s ssl-cert >/dev/null 2>&1 && [[ -f /etc/ssl/certs/ssl-cert-snakeoil.pem ]]; then
+    if has_tool ssl-cert >/dev/null 2>&1 && [[ -f /etc/ssl/certs/ssl-cert-snakeoil.pem ]]; then
         SYSTEM_STATE+=("snakeoil_cert_available")
     fi
 
@@ -483,9 +651,16 @@ inspect_system_state() {
             log_debug "I cannot check the be-BOP site is available without a domain."
         elif has_fact "nginx_running" && has_fact "bebop_site_enabled"; then
             local test_url
-            local curl_args=("--silent" "--output" "/dev/null" "--write-out" "%{http_code}")
-            local domain="$(get_fact "specified_domain")"
+            local curl_args=(
+                "--connect-timeout" "$CURL_CONNECT_TIMEOUT"
+                "--fail"
+                "--max-time" "$CURL_DOWNLOAD_TIMEOUT"
+                "--output" "/dev/null"
+                "--silent"
+                "--write-out" "%{http_code}"
+            )
 
+            local domain="$(get_fact "specified_domain")"
             if [[ "$domain" = "localhost" ]]; then
                 test_url="http://localhost/"
             else
@@ -494,8 +669,8 @@ inspect_system_state() {
             fi
 
             # Test if the site responds (allow up to 5 seconds)
-            if command -v curl >/dev/null 2>&1; then
-                local response_code=$(curl "${curl_args[@]}" --connect-timeout 5 "$test_url" 2>/dev/null || echo "000")
+            if has_tool curl; then
+                local response_code=$(curl "${curl_args[@]}" "$test_url" 2>/dev/null || echo "000")
                 # Accept any 2xx, 3xx, 4xx response (shows nginx is routing correctly)
                 if [[ "$response_code" =~ ^[234][0-9][0-9]$ ]]; then
                     SYSTEM_STATE+=("bebop_site_running")
@@ -504,24 +679,33 @@ inspect_system_state() {
         fi
     fi
 
-    if command -v certbot >/dev/null 2>&1; then
+    if has_tool certbot; then
         SYSTEM_STATE+=("certbot_installed")
     fi
 
-    if systemctl is-active --quiet minio 2>/dev/null; then
+    if has_tool systemctl && systemctl is-active --quiet minio 2>/dev/null; then
         SYSTEM_STATE+=("minio_running")
     fi
 
     # Check if MinIO is available but service not running (try HTTP check as fallback)
-    if ! has_fact "minio_running" && command -v curl >/dev/null 2>&1; then
+    if has_tool curl && ! has_fact "minio_running"; then
         # Check if MinIO is responding via HTTP (even if systemctl doesn't show it as active)
-        local minio_response=$(curl --silent --fail --output /dev/null --write-out "%{http_code}" --connect-timeout 5 "http://localhost:9000/minio/health/live" 2>/dev/null || echo "000")
+        local curl_args=(
+            "--connect-timeout" "$CURL_CONNECT_TIMEOUT"
+            "--fail"
+            "--max-time" "$CURL_DOWNLOAD_TIMEOUT"
+            "--output" "/dev/null"
+            "--silent"
+            "--write-out" "%{http_code}"
+        )
+        local url="http://localhost:9000/minio/health/live"
+        local minio_response=$(curl "${curl_args[@]}" "$url" 2>/dev/null || echo "000")
         if [[ "$minio_response" =~ ^[234][0-9][0-9]$ ]]; then
             SYSTEM_STATE+=("minio_running")
         fi
     fi
 
-    if systemctl is-active --quiet bebop 2>/dev/null; then
+    if has_tool systemctl && systemctl is-active --quiet bebop 2>/dev/null; then
         SYSTEM_STATE+=("bebop_running")
     fi
 
@@ -542,7 +726,7 @@ inspect_system_state() {
         SYSTEM_STATE+=("minio_installed")
     fi
 
-    if systemctl is-active --quiet phoenixd 2>/dev/null; then
+    if has_tool systemctl && systemctl is-active --quiet phoenixd 2>/dev/null; then
         SYSTEM_STATE+=("phoenixd_running")
     fi
 
@@ -714,14 +898,23 @@ get_fact() {
 # will be empty and LATEST_RELEASE_ASSET_BASENAME unset. This can happen if
 # `jq` is not installed or we're unable to obtain the data from GitHub.
 determine_latest_release_meta() {
-    if ! command -v jq > /dev/null; then
-        log_debug "Could not fetch latest be-BOP release metadata since jq is not installed"
+    # has_tool cannot be used here as the tools may have been installed since
+    # the available tools were discovered.
+    if ! command -v jq &>/dev/null || ! command -v curl &>/dev/null; then
+        log_debug "Could not fetch latest be-BOP release metadata since jq or curl is not installed"
         export LATEST_RELEASE_META=""
         return 0
     fi
     log_info "📡 Fetching latest be-BOP release metadata..."
+    local curl_args=(
+        "--connect-timeout" "$CURL_CONNECT_TIMEOUT"
+        "--fail"
+        "--location"
+        "--max-time" "$CURL_DOWNLOAD_TIMEOUT"
+        "--silent"
+    )
     local url="https://api.github.com/repos/${BEBOP_GITHUB_REPO}/releases/latest"
-    export LATEST_RELEASE_META="$(curl --connect-timeout 5 --silent --fail "$url" 2>/dev/null || true)"
+    export LATEST_RELEASE_META="$(curl "${curl_args[@]}" "$url" 2>/dev/null || true)"
     log_debug "Latest release metadata: $(echo "$LATEST_RELEASE_META" | jq -c .)"
     local filter='
         .assets[]
@@ -731,6 +924,152 @@ determine_latest_release_meta() {
     '
     if [[ -n "$LATEST_RELEASE_META" ]]; then
         export LATEST_RELEASE_ASSET_BASENAME=$(echo "$LATEST_RELEASE_META" | jq -r "$filter" | head -n 1)
+    fi
+}
+
+die_unsupported_os_distribution_for_tasks() {
+    local tasks=("$@")
+    local distro_name="${DETECTED_HUMAN_OS_DISTRIBUTION:-}"
+    local comment=""
+    if ! has_fact systemd_operational; then
+        comment="(systemd not operational)"
+    fi
+
+    local task_descriptions=()
+    for task in "${tasks[@]}"; do
+        local description
+        if description="$(describe_task "$task")"; then
+            task_descriptions+=("$description")
+        fi
+    done
+
+    if [[ -n "$distro_name" ]]; then
+        log_error "Unsupported OS distribution: $distro_name $comment"
+    else
+        log_error "Unsupported unknown OS distribution $comment"
+    fi
+    log_error "The script paused to prevent any potential issues."
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "💡 The script stopped safely — your Linux or BSD distribution is not supported yet."
+    echo ""
+    if [[ -n "$distro_name" ]]; then
+        echo "Your operating system distribution appears to be:"
+        echo "   • ${distro_name} $comment"
+        echo ""
+    fi
+    if [[ "${tasks[*]}" =~ install_missing_tools ]]; then
+        echo "We couldn’t verify that all the necessary tools are installed, and this script"
+        echo "does not yet know how to install them automatically on your distribution."
+        echo ""
+        echo "The following tools are necessary but could not be found:"
+        for tool in "${INSTALL_TOOLS[@]}"; do
+            echo "   • ${tool}"
+        done
+        echo ""
+        echo "You have two safe options to continue:"
+        echo "   1. Install the missing tools manually using your distribution’s package system."
+        echo "   2. Reach out and tell us your distribution name — we're always looking to make"
+        echo "      the wizard smarter and compatible with more systems 🧙."
+    elif [[ "${tasks[*]}" =~ configure_mongodb_repo ]]; then
+        echo "We couldn’t verify that MongoDB is installed, and this script doesn’t yet know"
+        echo "how to install MongoDB automatically on your distribution."
+        echo ""
+        echo "You have two safe options to continue:"
+        echo "   1. Install MongoDB manually using your distribution’s package system"
+        echo "      and ensure command mongosh is available."
+        echo "   2. Reach out and tell us your distribution name — we're always looking to make"
+        echo "      the wizard smarter and compatible with more systems 🧙."
+    else
+        if [[ ${#task_descriptions[@]} -ne 0 ]]; then
+            echo "This script doesn’t yet know how to perform the following task in your"
+            echo "distribution’s environment:"
+            for description in "${task_descriptions[@]}"; do
+                echo "   • ${description}"
+            done
+            echo ""
+            echo "Please reach out and tell us your distribution name — we're always looking to"
+            echo "make the wizard smarter and compatible with more systems 🧙."
+        else
+            echo "This script doesn’t yet know how to work with your distribution’s environment"
+            echo "or package system. Please reach out and tell us your distribution name — we're"
+            echo "always looking to make the wizard smarter and compatible with more systems 🧙."
+        fi
+    fi
+    echo ""
+    echo "🪪 Contact options:"
+    echo "   - Email: contact@be-bop.io"
+    echo "   - Nostr: npub16l9pnrkhhagkucjhxvvztz2czv9ex8s5u7yg80ghw9ccjp4j25pqaku4ha"
+    echo ""
+    echo "📡 Stay tuned for new distribution support and updates:"
+    echo "   → https://be-bop.io/release-note"
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    exit "$EXIT_INCOMPATIBLE_SYSTEM_STATE"
+}
+
+check_os_supported_by_wizard() {
+    local unsupported_tasks=()
+
+    local os_name="$(get_fact os_name)"
+    local os_release="$(get_fact os_release)"
+    case "$os_name-$os_release" in
+        debian-bookworm) ;;
+        debian-bullseye) ;;
+        debian-buster) ;;
+        debian-jessie) ;;
+        debian-stretch) ;;
+        debian-wheezy) ;;
+        ubuntu-bionic) ;;
+        ubuntu-focal) ;;
+        ubuntu-jammy) ;;
+        ubuntu-noble) ;;
+        ubuntu-precise) ;;
+        ubuntu-trusty) ;;
+        ubuntu-xenial) ;;
+        *)
+            if [[ "${TASK_PLAN[*]}" =~ "configure_mongodb_repo" ]]; then
+                unsupported_tasks+=("configure_mongodb_repo")
+            fi
+            ;;
+    esac
+    if [[ ${#INSTALL_TOOLS[@]} -ne 0 ]] && ! has_tool apt; then
+        unsupported_tasks+=("install_missing_tools")
+    fi
+    local tasks_requiring_apt=(
+        "configure_mongodb_repo"
+        "configure_nodejs_repo"
+        "install_mongodb"
+        "install_nodejs"
+    )
+    for task in "${tasks_requiring_apt[@]}"; do
+        if [[ "${TASK_PLAN[*]}" =~ "$task" ]] && ! has_tool apt; then
+            unsupported_tasks+=("$task")
+        fi
+    done
+    local tasks_requiring_systemd_operational=(
+        "configure_bebop_hardening_overrides"
+        "configure_minio_hardening_overrides"
+        "configure_phoenixd_hardening_overrides"
+        "initialize_mongodb_rs"
+        "install_bebop_service"
+        "install_minio_service"
+        "install_phoenixd_service"
+        "reload_nginx"
+        "restart_bebop"
+        "restart_minio"
+        "start_and_enable_bebop"
+        "start_and_enable_minio"
+        "start_and_enable_nginx"
+        "start_and_enable_phoenixd"
+    )
+    for task in "${tasks_requiring_systemd_operational[@]}"; do
+        if [[ "${TASK_PLAN[*]}" =~ "$task" ]] && ! has_fact systemd_operational; then
+            unsupported_tasks+=("$task")
+        fi
+    done
+    if [[ ${#unsupported_tasks[@]} -ne 0 ]]; then
+        die_unsupported_os_distribution_for_tasks "${unsupported_tasks[@]}"
     fi
 }
 
@@ -915,7 +1254,7 @@ handle_missing_flags() {
     echo ""
     echo "Once you add the missing flag(s), just re-run the script — it’ll pick up right it left off."
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    exit 1
+    exit "$EXIT_ERROR"
 }
 
 list_tools_for_task() {
@@ -1002,7 +1341,7 @@ summarize_state_and_plan() {
             echo "✓ be-BOP site enabled"
         elif has_fact "nginx_running"; then
             echo "⚠ installed but not running"
-        elif has_fact "nginx_installed"; then
+        elif has_tool nginx; then
             echo "⚠ installed but not running"
         else
             echo "✗ missing"
@@ -1097,8 +1436,10 @@ summarize_state_and_plan() {
     if email="$(get_fact "specified_email")"; then
         echo "Email: $email"
     fi
-    echo "Environment: $DETECTED_OS $DETECTED_VERSION"
-    echo ""
+    if [[ -n "${DETECTED_HUMAN_OS_DISTRIBUTION:-}" ]]; then
+        echo "Environment: $DETECTED_HUMAN_OS_DISTRIBUTION"
+        echo ""
+    fi
 
     echo "Current system status:"
     echo "  • Node.js: $(nodejs_state)"
@@ -1199,8 +1540,11 @@ describe_task() {
         "start_and_enable_phoenixd") echo "Start and enable phoenixd service" ;;
         "write_bebop_configuration") echo "Write be-BOP configuration" ;;
         "write_minio_configuration") echo "Write MinIO configuration" ;;
-        *) echo "Unknown action: $1" ;;
+        *)
+            return 1
+            ;;
     esac
+    return 0
 }
 
 # ---[ 6. Run the tasks ]---
@@ -1237,26 +1581,34 @@ run_task() {
         "start_and_enable_phoenixd") start_and_enable_phoenixd ;;
         "write_bebop_configuration") write_bebop_configuration ;;
         "write_minio_configuration") write_minio_configuration ;;
-        *) die $EXIT_ERROR "Unknown action: $1" ;;
+        *) die $EXIT_ERROR $LINENO "Unable to execute task: $1" ;;
     esac
 }
 
 configure_nodejs_repo() {
     log_info "Configuring Node.js repository..."
 
-    local NODE_MAJOR=22
+    local node_major="$NODEJS_MAJOR_VERSION"
     local TMPDIR=$(mktemp -d)
     # shellcheck disable=SC2064  # TMPDIR should be expanded here (and not on trap).
     trap "rm -rf $TMPDIR" RETURN 2>/dev/null || true
 
     # Download and add NodeSource GPG key
-    curl --connect-timeout 5 -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | \
+    local curl_args=(
+        "--connect-timeout" "$CURL_CONNECT_TIMEOUT"
+        "--fail"
+        "--location"
+        "--max-time" "$CURL_DOWNLOAD_TIMEOUT"
+        "--show-error"
+        "--silent"
+    )
+    curl "${curl_args[@]}" https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | \
         gpg --batch --yes --output "$TMPDIR/nodesource.gpg" --dearmor
 
     # Create repository configuration
     cat > "$TMPDIR/nodesource.list" << EOF
 # This file is managed by be-bop-wizard
-deb [signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_MAJOR}.x nodistro main
+deb [signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${node_major}.x nodistro main
 EOF
 
     # Create package preferences
@@ -1266,10 +1618,9 @@ Pin: origin deb.nodesource.com
 Pin-Priority: 600
 EOF
 
-    # Install configuration files using ucf
-    ucf_install "$TMPDIR/nodesource.gpg" /usr/share/keyrings/nodesource.gpg
-    ucf_install "$TMPDIR/nodesource.list" /etc/apt/sources.list.d/nodesource.list
-    ucf_install "$TMPDIR/nodejs" /etc/apt/preferences.d/nodejs
+    install_file "$TMPDIR/nodesource.gpg" /usr/share/keyrings/nodesource.gpg
+    install_file "$TMPDIR/nodesource.list" /etc/apt/sources.list.d/nodesource.list
+    install_file "$TMPDIR/nodejs" /etc/apt/preferences.d/nodejs
 
     # Cleanup
     rm -rf "$TMPDIR"
@@ -1279,33 +1630,21 @@ EOF
 configure_mongodb_repo() {
     log_info "Configuring MongoDB repository..."
 
-    if [[ ! -f /etc/os-release ]]; then
-        die $EXIT_FATAL "Cannot determine OS version"
-    fi
+    local os_name="$(get_fact "os_name")"
+    local os_release="$(get_fact "os_release")"
+    log_debug "Installing mongodb repository for ${os_name} ${os_release}"
 
-    source /etc/os-release
-    local RELEASE="$VERSION_CODENAME"
-    local DISTRIBUTION="$ID"
-
-    # Determine archive component
-    case "$DISTRIBUTION" in
-        ubuntu)
-            local ARCHIVE="multiverse"
+    case "$os_name-$os_release" in
+        debian-bookworm|debian-bullseye|debian-buster|debian-jessie|debian-stretch|debian-wheezy)
+            local archive="main"
             ;;
-        debian)
-            local ARCHIVE="main"
+        ubuntu-bionic|ubuntu-focal|ubuntu-jammy|ubuntu-noble|ubuntu-precise|ubuntu-trusty|ubuntu-xenial)
+            local archive="multiverse"
             ;;
         *)
-            die $EXIT_FATAL "Unsupported distribution: ${DISTRIBUTION}"
-            ;;
-    esac
-
-    # Validate supported releases
-    case "$DISTRIBUTION-$RELEASE" in
-        ubuntu-noble|ubuntu-jammy|ubuntu-focal|debian-bookworm)
-            ;;
-        *)
-            die $EXIT_FATAL "Unsupported release: ${DISTRIBUTION} ${RELEASE}"
+            # We should not reach this case: check_os_supported_by_wizard should
+            # have explained the user the distribution is unsupported.
+            die $EXIT_ERROR $LINENO "Unsupported distribution: ${os_name} ${os_release}"
             ;;
     esac
 
@@ -1314,18 +1653,25 @@ configure_mongodb_repo() {
     trap "rm -rf $TMPDIR" RETURN 2>/dev/null || true
 
     # Download and add MongoDB GPG key
-    curl --connect-timeout 5 -fsSL https://www.mongodb.org/static/pgp/server-8.0.asc | \
+    local curl_args=(
+        "--connect-timeout" "$CURL_CONNECT_TIMEOUT"
+        "--fail"
+        "--location"
+        "--max-time" "$CURL_DOWNLOAD_TIMEOUT"
+        "--show-error"
+        "--silent"
+    )
+    curl "${curl_args[@]}" https://www.mongodb.org/static/pgp/server-8.0.asc | \
         gpg --batch --yes --output "$TMPDIR/mongodb-server-8.0.gpg" --dearmor
 
     # Create repository configuration
     cat > "$TMPDIR/mongodb-org-8.0.list" << EOF
 # This file is managed by be-bop-wizard
-deb [arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/${DISTRIBUTION} ${RELEASE}/mongodb-org/8.0 ${ARCHIVE}
+deb [arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg] https://repo.mongodb.org/apt/${os_name} ${os_release}/mongodb-org/${MONGODB_VERSION} ${archive}
 EOF
 
-    # Install configuration files using ucf
-    ucf_install "$TMPDIR/mongodb-server-8.0.gpg" /usr/share/keyrings/mongodb-server-8.0.gpg
-    ucf_install "$TMPDIR/mongodb-org-8.0.list" /etc/apt/sources.list.d/mongodb-org-8.0.list
+    install_file "$TMPDIR/mongodb-server-8.0.gpg" /usr/share/keyrings/mongodb-server-8.0.gpg
+    install_file "$TMPDIR/mongodb-org-8.0.list" /etc/apt/sources.list.d/mongodb-org-${MONGODB_VERSION}.list
 
     # Cleanup
     rm -rf "$TMPDIR"
@@ -1344,41 +1690,42 @@ install_mongodb() {
 
 start_and_enable_mongodb() {
     log_info "Starting and enabling MongoDB service..."
-    # Configure replica set in mongod.conf
-    run_privileged sed -i '/^#\?replication:/,/^[^ ]/c replication:\n  replSetName: "rs0"' /etc/mongod.conf
     run_privileged systemctl enable mongod
     run_privileged systemctl start mongod
 }
 
-initialize_mongodb_rs() {
-    log_info "Initializing MongoDB replica set..."
-    # Wait for MongoDB to be ready
-    local retries=10
+wait_mongodb_ready() {
+    local retries="$SERVICE_TEST_START_RETRIES"
     while ! mongosh --quiet --eval "db.adminCommand('ping')" >/dev/null 2>&1; do
         if [[ $retries -le 0 ]]; then
-            die $EXIT_ERROR "MongoDB failed to start after 30 seconds"
+            die $EXIT_ERROR $LINENO "MongoDB failed to start after 30 seconds"
         fi
         log_debug "Waiting for MongoDB to be ready... ($retries retries left)"
-        sleep 3
+        sleep "$SERVICE_TEST_START_WAIT_SECONDS"
         ((retries--))
     done
+}
 
-    # Initialize replica set (ignore error if already initialized)
-    mongosh --eval 'rs.initiate()' >/dev/null 2>&1 || true
+initialize_mongodb_rs() {
+    log_info "Initializing MongoDB replica set..."
+
+    # Configure MongoDB replica set
+    run_privileged sed -i '/^#\?replication:/,/^[^ ]/c replication:\n  replSetName: "rs0"' /etc/mongod.conf
+    run_privileged systemctl restart mongod
+    wait_mongodb_ready
+
+    local out
+    if ! out="$(mongosh --eval 'rs.initiate()' 2>&1)"; then
+        # rs.initiate() is fragile and may sometimes “succeed” even when the command
+        # fails. If mongo reports the rs as initialized, disregard the error.
+        if ! mongosh --quiet --eval "rs.status().ok" 2>/dev/null | grep -q "1"; then
+            die $EXIT_ERROR $LINENO "Unable to initialize MongoDB replica set: $out"
+        fi
+    fi
 
     # Restart to ensure replica set configuration is fully applied
     run_privileged systemctl restart mongod
-
-    # Wait again after restart
-    retries=10
-    while ! mongosh --quiet --eval "db.adminCommand('ping')" >/dev/null 2>&1; do
-        if [[ $retries -le 0 ]]; then
-            die $EXIT_ERROR "MongoDB failed to restart after replica set initialization"
-        fi
-        log_debug "Waiting for MongoDB to be ready after restart... ($retries retries left)"
-        sleep 3
-        ((retries--))
-    done
+    wait_mongodb_ready
 }
 
 configure_bebop_site() {
@@ -1520,13 +1867,12 @@ server {
 EOF
     fi
 
-    # Install configuration using ucf
-    ucf_install "$TMPDIR/be-BOP.conf" /etc/nginx/sites-available/be-BOP.conf
+    install_file "$TMPDIR/be-BOP.conf" /etc/nginx/sites-available/be-BOP.conf
     run_privileged ln -sf /etc/nginx/sites-available/be-BOP.conf /etc/nginx/sites-enabled/
 
     # Test nginx configuration
     if ! run_privileged nginx -t; then
-        die $EXIT_ERROR "nginx configuration test failed"
+        die $EXIT_ERROR $LINENO "nginx configuration test failed"
     fi
 
     # Cleanup
@@ -1555,7 +1901,6 @@ provision_ssl_cert() {
 install_phoenixd() {
     log_info "Installing phoenixd Lightning Network daemon..."
 
-    local PHOENIXD_VERSION="0.6.2"
     local STOW_DIR="/usr/local/phoenixd"
     local PACKAGE_DIR="$STOW_DIR/phoenixd-${PHOENIXD_VERSION}"
 
@@ -1570,9 +1915,18 @@ install_phoenixd() {
         pushd "$TEMP_DIR" > /dev/null
 
         # Download and extract phoenixd
-        local PHOENIXD_URL="https://github.com/ACINQ/phoenixd/releases/download/v${PHOENIXD_VERSION}/phoenixd-${PHOENIXD_VERSION}-linux-x64.zip"
-        log_info "Downloading phoenixd ${PHOENIXD_VERSION} from ${PHOENIXD_URL}"
-        curl --connect-timeout 5 -fSL# "$PHOENIXD_URL" -o phoenixd.zip -m 300
+        local phoenixd_url="https://github.com/ACINQ/phoenixd/releases/download/v${PHOENIXD_VERSION}/phoenixd-${PHOENIXD_VERSION}-linux-x64.zip"
+        log_info "Downloading phoenixd ${PHOENIXD_VERSION} from ${phoenixd_url}"
+        local curl_args=(
+            "--connect-timeout" "$CURL_CONNECT_TIMEOUT"
+            "--fail"
+            "--location"
+            "--max-time" "$CURL_DOWNLOAD_TIMEOUT"
+            "--progress-bar"
+            "--show-error"
+            "--output" phoenixd.zip
+        )
+        curl "${curl_args[@]}" "$phoenixd_url"
         unzip -q phoenixd.zip
 
         # Create stow directory structure
@@ -1596,7 +1950,6 @@ install_phoenixd() {
 install_minio() {
     log_info "Installing MinIO object storage server..."
 
-    local MINIO_VERSION="RELEASE.2025-09-07T16-13-09Z"
     local STOW_DIR="/usr/local/minio"
     local PACKAGE_DIR="$STOW_DIR/minio-${MINIO_VERSION}"
 
@@ -1613,7 +1966,16 @@ install_minio() {
         # Download MinIO binary
         local MINIO_URL="https://dl.min.io/server/minio/release/linux-amd64/archive/minio.${MINIO_VERSION}"
         log_info "Downloading MinIO ${MINIO_VERSION} from ${MINIO_URL}"
-        curl --connect-timeout 5 -fSL# "$MINIO_URL" -o minio -m 300
+        local curl_args=(
+            "--connect-timeout" "$CURL_CONNECT_TIMEOUT"
+            "--fail"
+            "--location"
+            "--max-time" "$CURL_DOWNLOAD_TIMEOUT"
+            "--progress-bar"
+            "--show-error"
+            "--output" minio
+        )
+        curl "${curl_args[@]}" "$MINIO_URL"
 
         # Create stow directory structure
         run_privileged mkdir -p "$PACKAGE_DIR/bin"
@@ -1660,9 +2022,8 @@ EOF
         sed -i 's|MINIO_SERVER_URL=https://|MINIO_SERVER_URL=http://|' "$TMPDIR/config.env"
     fi
 
-    # Install configuration using ucf
     run_privileged mkdir -p /etc/minio
-    ucf_install "$TMPDIR/config.env" /etc/minio/config.env
+    install_file "$TMPDIR/config.env" /etc/minio/config.env
     # Ensure it's world-readable (so the configured domain can be checked)
     run_privileged chmod 644 /etc/minio/config.env
 
@@ -1679,7 +2040,7 @@ write_bebop_configuration() {
     local S3_ROOT_PASSWORD=$(run_privileged grep '^MINIO_ROOT_PASSWORD=' /etc/minio/config.env 2>/dev/null | cut -d'=' -f2- || echo "")
 
     if [[ -z "$S3_ROOT_USER" ]] || [[ -z "$S3_ROOT_PASSWORD" ]]; then
-        die $EXIT_ERROR "Could not find MinIO credentials in /etc/minio/config.env"
+        die $EXIT_ERROR $LINENO "Could not find MinIO credentials in /etc/minio/config.env"
     fi
 
     local TMPDIR=$(mktemp -d)
@@ -1710,9 +2071,8 @@ EOF
         sed -i 's|PUBLIC_S3_ENDPOINT_URL=https://|PUBLIC_S3_ENDPOINT_URL=http://|' "$TMPDIR/config.env"
     fi
 
-    # Install configuration using ucf
     run_privileged mkdir -p /etc/be-BOP
-    ucf_install "$TMPDIR/config.env" /etc/be-BOP/config.env
+    install_file "$TMPDIR/config.env" /etc/be-BOP/config.env
     # Ensure it's world-readable (so the configured domain can be checked)
     run_privileged chmod 644 /etc/be-BOP/config.env
 
@@ -1763,8 +2123,7 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 EOF
 
-    # Install service file using ucf
-    ucf_install "$TMPDIR/phoenixd.service" /etc/systemd/system/phoenixd.service
+    install_file "$TMPDIR/phoenixd.service" /etc/systemd/system/phoenixd.service
     run_privileged systemctl daemon-reload
 
     # Cleanup
@@ -1816,8 +2175,7 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 EOF
 
-    # Install service file using ucf
-    ucf_install "$TMPDIR/minio.service" /etc/systemd/system/minio.service
+    install_file "$TMPDIR/minio.service" /etc/systemd/system/minio.service
     run_privileged systemctl daemon-reload
 
     # Cleanup
@@ -1869,8 +2227,7 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 EOF
 
-    # Install service file using ucf
-    ucf_install "$TMPDIR/bebop.service" /etc/systemd/system/bebop.service
+    install_file "$TMPDIR/bebop.service" /etc/systemd/system/bebop.service
     run_privileged systemctl daemon-reload
 
     # Cleanup
@@ -1908,7 +2265,7 @@ EOF
 
     # Create override directory and install configuration
     run_privileged mkdir -p /etc/systemd/system/phoenixd.service.d
-    ucf_install "$TMPDIR/overrides.conf" /etc/systemd/system/phoenixd.service.d/overrides.conf
+    install_file "$TMPDIR/overrides.conf" /etc/systemd/system/phoenixd.service.d/overrides.conf
     run_privileged systemctl daemon-reload
 
     # Cleanup
@@ -1945,7 +2302,7 @@ EOF
 
     # Create override directory and install configuration
     run_privileged mkdir -p /etc/systemd/system/minio.service.d
-    ucf_install "$TMPDIR/overrides.conf" /etc/systemd/system/minio.service.d/overrides.conf
+    install_file "$TMPDIR/overrides.conf" /etc/systemd/system/minio.service.d/overrides.conf
     run_privileged systemctl daemon-reload
 
     # Cleanup
@@ -1981,7 +2338,7 @@ EOF
 
     # Create override directory and install configuration
     run_privileged mkdir -p /etc/systemd/system/bebop.service.d
-    ucf_install "$TMPDIR/overrides.conf" /etc/systemd/system/bebop.service.d/overrides.conf
+    install_file "$TMPDIR/overrides.conf" /etc/systemd/system/bebop.service.d/overrides.conf
     run_privileged systemctl daemon-reload
 
     # Cleanup
@@ -2046,7 +2403,7 @@ I will skip the current step, leave the existing installation intact, and contin
 Please check your internet connection and try again at a later time."
             return 0
         else
-            die $EXIT_ERROR "Unable to retrieve latest be-BOP release information"
+            die $EXIT_ERROR $LINENO "Unable to retrieve latest be-BOP release information"
         fi
     fi
 
@@ -2064,16 +2421,25 @@ Please check your internet connection and try again at a later time."
         local LATEST_RELEASE_URL=$(echo "$LATEST_RELEASE_META" | jq -r "$filter")
 
         if [[ -z "$LATEST_RELEASE_URL" || "$LATEST_RELEASE_URL" = "null" ]]; then
-            die $EXIT_ERROR "Could not find latest be-BOP release URL"
+            die $EXIT_ERROR $LINENO "Could not find latest be-BOP release URL"
         fi
 
         log_info "Downloading ${LATEST_RELEASE_ASSET_BASENAME} from ${LATEST_RELEASE_URL}"
-        curl --connect-timeout 5 -fSL# "$LATEST_RELEASE_URL" -o be-BOP-latest.zip -m 300
+        local curl_args=(
+            "--connect-timeout" "$CURL_CONNECT_TIMEOUT"
+            "--fail"
+            "--location"
+            "--max-time" "$CURL_DOWNLOAD_TIMEOUT"
+            "--progress-bar"
+            "--show-error"
+            "--output" "be-BOP-latest.zip"
+        )
+        curl "${curl_args[@]}" "$LATEST_RELEASE_URL"
         unzip -q be-BOP-latest.zip
 
         local EXTRACTED_DIR=$(find . -maxdepth 1 -type d -name "be-BOP release *" | head -1)
         if [[ -z "$EXTRACTED_DIR" ]]; then
-            die $EXIT_ERROR "Could not find extracted directory for be-BOP release"
+            die $EXIT_ERROR $LINENO "Could not find extracted directory for be-BOP release"
         fi
 
         if [[ -d "$TARGET_DIR" ]]; then
@@ -2101,7 +2467,7 @@ Please check your internet connection and try again at a later time."
     if [[ -L /var/lib/be-BOP/releases/current ]]; then
         run_privileged rm -f /var/lib/be-BOP/releases/current
     elif [[ -e /var/lib/be-BOP/releases/current ]]; then
-        die $EXIT_ERROR "Something unknown is blocking the creation of /var/lib/be-BOP/releases/current symlink. Please check what exists at this path and remove it manually."
+        die $EXIT_ERROR $LINENO "Something unknown is blocking the creation of /var/lib/be-BOP/releases/current symlink. Please check what exists at this path and remove it manually."
     fi
     run_privileged ln -sf "$TARGET_DIR" /var/lib/be-BOP/releases/current
 }
@@ -2179,11 +2545,11 @@ main() {
     check_privileges
 
     # Detect environment and inspect system state
-    detect_environment
     determine_latest_release_meta
     inspect_system_state
     plan_setup_tasks
     collect_all_required_tools
+    check_os_supported_by_wizard
 
     summarize_state_and_plan
 
