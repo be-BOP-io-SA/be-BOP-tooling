@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.2.1"
+readonly SCRIPT_VERSION="2.2.2"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -1690,15 +1690,11 @@ install_mongodb() {
 
 start_and_enable_mongodb() {
     log_info "Starting and enabling MongoDB service..."
-    # Configure replica set in mongod.conf
-    run_privileged sed -i '/^#\?replication:/,/^[^ ]/c replication:\n  replSetName: "rs0"' /etc/mongod.conf
     run_privileged systemctl enable mongod
     run_privileged systemctl start mongod
 }
 
-initialize_mongodb_rs() {
-    log_info "Initializing MongoDB replica set..."
-    # Wait for MongoDB to be ready
+wait_mongodb_ready() {
     local retries="$SERVICE_TEST_START_RETRIES"
     while ! mongosh --quiet --eval "db.adminCommand('ping')" >/dev/null 2>&1; do
         if [[ $retries -le 0 ]]; then
@@ -1708,23 +1704,28 @@ initialize_mongodb_rs() {
         sleep "$SERVICE_TEST_START_WAIT_SECONDS"
         ((retries--))
     done
+}
 
-    # Initialize replica set (ignore error if already initialized)
-    mongosh --eval 'rs.initiate()' >/dev/null 2>&1 || true
+initialize_mongodb_rs() {
+    log_info "Initializing MongoDB replica set..."
+
+    # Configure MongoDB replica set
+    run_privileged sed -i '/^#\?replication:/,/^[^ ]/c replication:\n  replSetName: "rs0"' /etc/mongod.conf
+    run_privileged systemctl restart mongod
+    wait_mongodb_ready
+
+    local out
+    if ! out="$(mongosh --eval 'rs.initiate()' 2>&1)"; then
+        # rs.initiate() is fragile and may sometimes “succeed” even when the command
+        # fails. If mongo reports the rs as initialized, disregard the error.
+        if ! mongosh --quiet --eval "rs.status().ok" 2>/dev/null | grep -q "1"; then
+            die $EXIT_ERROR $LINENO "Unable to initialize MongoDB replica set: $out"
+        fi
+    fi
 
     # Restart to ensure replica set configuration is fully applied
     run_privileged systemctl restart mongod
-
-    # Wait again after restart
-    retries="$SERVICE_TEST_START_RETRIES"
-    while ! mongosh --quiet --eval "db.adminCommand('ping')" >/dev/null 2>&1; do
-        if [[ $retries -le 0 ]]; then
-            die $EXIT_ERROR $LINENO "MongoDB failed to restart after replica set initialization"
-        fi
-        log_debug "Waiting for MongoDB to be ready after restart... ($retries retries left)"
-        sleep "$SERVICE_TEST_START_WAIT_SECONDS"
-        ((retries--))
-    done
+    wait_mongodb_ready
 }
 
 configure_bebop_site() {
