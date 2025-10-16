@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.2.3"
+readonly SCRIPT_VERSION="2.2.4"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -79,7 +79,7 @@ readonly PHOENIXD_VERSION="0.6.2"
 readonly MINIO_VERSION="RELEASE.2025-09-07T16-13-09Z"
 
 # Error trap handler
-handle_error() {
+die_unexpected_error_in_function() {
     local exit_code=$?
     local line_number=$1
 
@@ -115,7 +115,7 @@ handle_error() {
 }
 
 # Set up error trap
-trap 'handle_error $LINENO' ERR
+trap 'die_unexpected_error_in_function $LINENO' ERR
 
 # Global configuration
 ALLOW_ROOT=false
@@ -316,7 +316,7 @@ COMMON OPTIONS:
     --email <address>       Contact email for Let's Encrypt registration
 
 MORE OPTIONS:
-    --allow-root            Allow running as root (not recommended)
+    --allow-root            Allow running as root (discouraged)
     --dry-run               Do not make any changes, print what would be done
     --help, -h              Show this help message
     --non-interactive       Do not prompt for confirmations (for automation)
@@ -333,10 +333,8 @@ For more information, visit: https://github.com/be-BOP-io-SA/be-BOP
 EOF
 }
 
-FULL_CMD_LINE=()
-
-# Parse command line arguments
-parse_args() {
+parse_cli_arguments() {
+    export FULL_CMD_LINE=()
     while [[ $# -gt 0 ]]; do
         FULL_CMD_LINE+=("$1")
         case $1 in
@@ -443,8 +441,8 @@ check_privileges() {
                 fi
                 export RUNNING_AS_ROOT=true
             else
-                log_warn "Running as root is not recommended."
-                log_warn "If you must run as root, use --allow-root flag."
+                log_warn "Running as root is discouraged."
+                log_warn "If you must run as root, use the --allow-root option."
                 die $EXIT_ERROR $LINENO "Running as root is discouraged. Use --allow-root if you really need to run as root, or run as a regular user."
             fi
         else
@@ -1228,62 +1226,62 @@ plan_setup_tasks() {
     log_debug "Planned actions: ${TASK_PLAN[*]}"
 }
 
-check_missing_flags() {
-    export REQUIRED_FLAGS=()
-    export TASKS_REQUIRING_FLAGS=()
+check_options_required_by_planned_tasks_but_missing() {
+    export REQUIRED_OPTIONS=()
+    export TASKS_REQUIRING_OPTIONS=()
     for task in "${TASK_PLAN[@]}"; do
         case "$task" in
             "configure_bebop_site"|"write_bebop_configuration"|"write_minio_configuration")
                 if ! has_fact "specified_domain"; then
-                    REQUIRED_FLAGS+=("domain")
-                    TASKS_REQUIRING_FLAGS+=("$task")
+                    REQUIRED_OPTIONS+=("domain")
+                    TASKS_REQUIRING_OPTIONS+=("$task")
                 fi
                 ;;
             "provision_ssl_cert")
                 if ! has_fact "specified_domain"; then
-                    REQUIRED_FLAGS+=("domain")
-                    TASKS_REQUIRING_FLAGS+=("$task")
+                    REQUIRED_OPTIONS+=("domain")
+                    TASKS_REQUIRING_OPTIONS+=("$task")
                 fi
                 if ! has_fact "specified_email"; then
-                    REQUIRED_FLAGS+=("email")
-                    TASKS_REQUIRING_FLAGS+=("$task")
+                    REQUIRED_OPTIONS+=("email")
+                    TASKS_REQUIRING_OPTIONS+=("$task")
                 fi
                 ;;
             *)
                 ;;
         esac
     done
-    local deduplicated=($(printf '%s\n' "${REQUIRED_FLAGS[@]}" | sort -u))
-    REQUIRED_FLAGS=("${deduplicated[@]}")
+    local deduplicated=($(printf '%s\n' "${REQUIRED_OPTIONS[@]}" | sort -u))
+    REQUIRED_OPTIONS=("${deduplicated[@]}")
 
-    if [ ${#REQUIRED_FLAGS[@]} -gt 0 ]; then
-        return 1
+    if [ ${#REQUIRED_OPTIONS[@]} -gt 0 ]; then
+        die_missing_options
     fi
 }
 
-handle_missing_flags() {
+die_missing_options() {
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     echo "💡 The script paused safely — we need a bit more information to start."
     echo ""
-    echo "To move forward, please include the following flag(s):"
-    for flag in "${REQUIRED_FLAGS[@]}"; do
-        echo "   • --${flag}"
+    echo "To move forward, please include the following options(s):"
+    for option in "${REQUIRED_OPTIONS[@]}"; do
+        echo "   • --${option}"
     done
     echo ""
     echo "The following steps are waiting for that info:"
-    for task in "${TASKS_REQUIRING_FLAGS[@]}"; do
+    for task in "${TASKS_REQUIRING_OPTIONS[@]}"; do
         echo "   • $(describe_task "$task")"
     done
     echo ""
     echo "👉 Example:"
-    echo "   $(basename "${0:-be-bop-wizard}") --${REQUIRED_FLAGS[0]} <value>"
+    echo "   $(basename "${0:-be-bop-wizard}") --${REQUIRED_OPTIONS[0]} <value>"
     echo ""
     echo "🪪 Need a hand or want to share feedback?"
     echo "   - Email: contact@be-bop.io"
     echo "   - Nostr: npub16l9pnrkhhagkucjhxvvztz2czv9ex8s5u7yg80ghw9ccjp4j25pqaku4ha"
     echo ""
-    echo "Once you add the missing flag(s), just re-run the script — it’ll pick up right it left off."
+    echo "Once you add the missing option(s), just re-run the script — it’ll pick up right it left off."
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     exit "$EXIT_ERROR"
 }
@@ -2582,11 +2580,7 @@ summarize_results() {
 # automation pipeline that anyone can follow step by step.
 main() {
     log_info "Starting $SCRIPT_NAME v$SCRIPT_VERSION (session: $SESSION_ID)"
-
-    # Parse arguments and validate
-    parse_args "$@"
-
-    # Check prerequisites
+    parse_cli_arguments "$@"
     check_privileges
 
     # Detect environment and inspect system state
@@ -2603,9 +2597,7 @@ main() {
         exit $EXIT_SUCCESS
     fi
 
-    if ! check_missing_flags; then
-        handle_missing_flags
-    fi
+    check_options_required_by_planned_tasks_but_missing
 
     if [ "$DRY_RUN" = true ]; then
         log_info "Exit before making any changes (--dry-run specified)."
