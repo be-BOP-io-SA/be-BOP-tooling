@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.2.0"
+readonly SCRIPT_VERSION="2.2.1"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -898,7 +898,9 @@ get_fact() {
 # will be empty and LATEST_RELEASE_ASSET_BASENAME unset. This can happen if
 # `jq` is not installed or we're unable to obtain the data from GitHub.
 determine_latest_release_meta() {
-    if ! has_tool jq || ! has_tool curl; then
+    # has_tool cannot be used here as the tools may have been installed since
+    # the available tools were discovered.
+    if ! command -v jq &>/dev/null || ! command -v curl &>/dev/null; then
         log_debug "Could not fetch latest be-BOP release metadata since jq or curl is not installed"
         export LATEST_RELEASE_META=""
         return 0
