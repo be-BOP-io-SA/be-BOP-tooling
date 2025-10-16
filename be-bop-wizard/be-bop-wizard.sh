@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="2.1.0"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -74,21 +74,23 @@ handle_error() {
     echo "✓ It's completely safe to re-run this script with the same arguments"
     echo "✓ The script will resume from where it left off"
     echo ""
-    echo "If you’d like to investigate or get help:"
-    echo "  1. Re-run with --verbose to get detailed output:"
-    if [[ -n "${DOMAIN:-}" && -n "${EMAIL:-}" ]]; then
-        local rerun_cmd="$(basename "${0:-be-bop-wizard}") --domain $DOMAIN --email $EMAIL"
-        [[ "$ALLOW_ROOT" = true ]] && rerun_cmd="$rerun_cmd --allow-root"
-        [[ "$RUN_NON_INTERACTIVE" = true ]] && rerun_cmd="$rerun_cmd --non-interactive"
-        [[ "$DRY_RUN" = true ]] && rerun_cmd="$rerun_cmd --dry-run"
-        echo "     $rerun_cmd --verbose"
+    if ! [[ "${FULL_CMD_LINE[*]}" =~ "--verbose" ]]; then
+        echo "If you’d like to investigate or get help, re-run with --verbose to get detailed output:"
+        echo "  $(basename "${0:-be-bop-wizard}") ${FULL_CMD_LINE[*]} --verbose"
+        echo ""
+        echo "Be kind to your terminal — it’s doing its best. 🧡"
     else
-        echo "     $(basename "${0:-be-bop-wizard}") --domain <your-domain> --email <your-email> --verbose"
+        echo "If you need assistance resolving this issue, please share the full command output with us."
+        echo ""
+        echo "🪪 Contact options:"
+        echo "    - Email: contact@be-bop.io"
+        echo "    - Nostr: npub16l9pnrkhhagkucjhxvvztz2czv9ex8s5u7yg80ghw9ccjp4j25pqaku4ha"
+        echo ""
+        echo "📡 Follow updates and tooling improvements at:"
+        echo "    → https://be-bop.io/release-note"
+        echo ""
+        echo "Thank you for helping us make things better — and for being a friendly human. 🤝"
     fi
-    echo ""
-    echo "  2. Share the verbose output when requesting support"
-    echo ""
-
     exit $exit_code
 }
 
@@ -97,9 +99,7 @@ trap 'handle_error $LINENO' ERR
 
 # Global configuration
 ALLOW_ROOT=false
-DOMAIN=""
 DRY_RUN=false
-EMAIL=""
 RUN_NON_INTERACTIVE=false
 SHELL_IS_INTERACTIVE=$([ -t 0 ] && [ -t 2 ] && echo true || echo false)
 VERBOSE=false
@@ -190,11 +190,11 @@ DESCRIPTION:
     Bootstrap utility for installing and configuring be-BOP on Debian-based systems.
     Prepares the environment and installs the last be-BOP release.
 
-REQUIRED OPTIONS:
+COMMON OPTIONS:
     --domain <FQDN>         Domain name for be-BOP installation
     --email <address>       Contact email for Let's Encrypt registration
 
-OPTIONS:
+MORE OPTIONS:
     --allow-root            Allow running as root (not recommended)
     --dry-run               Do not make any changes, print what would be done
     --help, -h              Show this help message
@@ -212,16 +212,20 @@ For more information, visit: https://github.com/be-BOP-io-SA/be-BOP
 EOF
 }
 
+FULL_CMD_LINE=()
+
 # Parse command line arguments
 parse_args() {
     while [[ $# -gt 0 ]]; do
+        FULL_CMD_LINE+=("$1")
         case $1 in
             --allow-root)
                 ALLOW_ROOT=true
                 shift
                 ;;
             --domain)
-                DOMAIN="$2"
+                export DOMAIN="$2"
+                FULL_CMD_LINE+=("$2")
                 shift 2
                 ;;
             --dry-run)
@@ -229,7 +233,8 @@ parse_args() {
                 shift
                 ;;
             --email)
-                EMAIL="$2"
+                export EMAIL="$2"
+                FULL_CMD_LINE+=("$2")
                 shift 2
                 ;;
             --help|-h)
@@ -251,16 +256,7 @@ parse_args() {
     done
 
     # Validate required arguments
-    if [[ -z "$DOMAIN" ]]; then
-        die $EXIT_ERROR "Domain is required. Use --domain <FQDN>"
-    fi
-
-    if [[ -z "$EMAIL" ]]; then
-        die $EXIT_ERROR "Email is required. Use --email <address>"
-    fi
-
-    # Basic domain validation
-    {
+    if [[ -n "${DOMAIN:-}" ]]; then
         if ! echo "$DOMAIN" | grep -qE '^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)+$'; then
             if [[ "$DOMAIN" != "localhost" ]]; then
                 die $EXIT_ERROR "Invalid domain format: $DOMAIN"
@@ -275,11 +271,13 @@ parse_args() {
                 die $EXIT_ERROR "Domain label too long (max 63 chars): $label"
             fi
         done
-    }
+    fi
 
     # Basic email validation
-    if ! echo "$EMAIL" | grep -qE '^[^@]+@[^@]+\.[^@]+$'; then
-        die $EXIT_ERROR "Invalid email format: $EMAIL"
+    if [[ -n "${EMAIL:-}" ]]; then
+        if ! echo "$EMAIL" | grep -qE '^[^@]+@[^@]+\.[^@]+$'; then
+            die $EXIT_ERROR "Invalid email format: $EMAIL"
+        fi
     fi
 }
 
@@ -402,6 +400,14 @@ inspect_system_state() {
         SYSTEM_STATE+=("running_in_container")
     fi
 
+    if [[ -n "${DOMAIN:-}" ]]; then
+        SYSTEM_STATE+=("specified_domain=${DOMAIN}")
+    fi
+
+    if [[ -n "${EMAIL:-}" ]]; then
+        SYSTEM_STATE+=("specified_email=${EMAIL}")
+    fi
+
     # Check what tools are available
     export AVAILABLE_TOOLS=()
     local potential_commands=("curl" "gpg" "jq" "openssl" "stow" "unzip")
@@ -468,20 +474,23 @@ inspect_system_state() {
         SYSTEM_STATE+=("bebop_site_enabled")
 
         # Check if nginx site is correctly configured for this domain
-        if validate_bebop_nginx_config_domains; then
-            SYSTEM_STATE+=("bebop_site_correctly_configured")
+        if ! validate_bebop_nginx_config_domains; then
+            SYSTEM_STATE+=("bebop_nginx_site_domain_mismatch")
         fi
 
         # Check if be-BOP site is actually responding via HTTP/HTTPS
-        if has_fact "nginx_running" && has_fact "bebop_site_enabled"; then
+        if ! has_fact "specified_domain"; then
+            log_debug "I cannot check the be-BOP site is available without a domain."
+        elif has_fact "nginx_running" && has_fact "bebop_site_enabled"; then
             local test_url
             local curl_args=("--silent" "--output" "/dev/null" "--write-out" "%{http_code}")
+            local domain="$(get_fact "specified_domain")"
 
-            if [[ "$DOMAIN" = "localhost" ]]; then
+            if [[ "$domain" = "localhost" ]]; then
                 test_url="http://localhost/"
             else
                 test_url="https://localhost/"
-                curl_args+=("-H" "Host: $DOMAIN" "-k")  # -k to ignore self-signed cert issues
+                curl_args+=("-H" "Host: $domain" "-k")  # -k to ignore self-signed cert issues
             fi
 
             # Test if the site responds (allow up to 5 seconds)
@@ -539,15 +548,15 @@ inspect_system_state() {
 
     if [[ -f /etc/minio/config.env ]]; then
         SYSTEM_STATE+=("minio_config_exists")
-        if validate_minio_config_domain; then
-            SYSTEM_STATE+=("minio_correctly_configured")
+        if ! validate_minio_config_domain; then
+            SYSTEM_STATE+=("minio_config_domain_mismatch")
         fi
     fi
 
     if [[ -f /etc/be-BOP/config.env ]]; then
         SYSTEM_STATE+=("bebop_config_exists")
-        if validate_bebop_config_domain; then
-            SYSTEM_STATE+=("bebop_correctly_configured")
+        if ! validate_bebop_config_domain; then
+            SYSTEM_STATE+=("bebop_config_domain_mismatch")
         fi
     fi
 
@@ -577,11 +586,17 @@ validate_bebop_nginx_config_domains() {
         return 1
     fi
 
+    local domain
+    if ! domain="$(get_fact "specified_domain")"; then
+        log_debug "Cannot validate nginx config, as the domain was not specified"
+        return 0
+    fi
+
     local expected_domains
-    if [[ "$DOMAIN" = "localhost" ]]; then
+    if [[ "$domain" = "localhost" ]]; then
         expected_domains="localhost s3.localhost"
     else
-        expected_domains="$DOMAIN s3.$DOMAIN"
+        expected_domains="$domain s3.$domain"
     fi
 
     for expected_domain in $expected_domains; do
@@ -599,11 +614,17 @@ validate_minio_config_domain() {
         return 1
     fi
 
+    local domain
+    if ! domain="$(get_fact "specified_domain")"; then
+        log_debug "Cannot validate minio config, as the domain was not specified"
+        return 0
+    fi
+
     local expected_url
-    if [[ "$DOMAIN" = "localhost" ]]; then
+    if [[ "$domain" = "localhost" ]]; then
         expected_url="http://s3.localhost"
     else
-        expected_url="https://s3.$DOMAIN"
+        expected_url="https://s3.$domain"
     fi
 
     if ! grep -q "^MINIO_SERVER_URL=$expected_url$" /etc/minio/config.env 2>/dev/null; then
@@ -619,13 +640,19 @@ validate_bebop_config_domain() {
         return 1
     fi
 
+    local domain
+    if ! domain="$(get_fact "specified_domain")"; then
+        log_debug "Cannot validate be-BOP config, as the domain was not specified"
+        return 0
+    fi
+
     local expected_origin expected_s3_url
-    if [[ "$DOMAIN" = "localhost" ]]; then
+    if [[ "$domain" = "localhost" ]]; then
         expected_origin="http://localhost"
         expected_s3_url="http://s3.localhost"
     else
-        expected_origin="https://$DOMAIN"
-        expected_s3_url="https://s3.$DOMAIN"
+        expected_origin="https://$domain"
+        expected_s3_url="https://s3.$domain"
     fi
 
     if ! grep -q "^ORIGIN=$expected_origin$" /etc/be-BOP/config.env 2>/dev/null; then
@@ -656,7 +683,22 @@ has_tool() {
 has_fact() {
     local fact="$1"
     for existing_fact in "${SYSTEM_STATE[@]}"; do
-        if [[ "$existing_fact" = "$fact" ]]; then
+        if [[ "$existing_fact" = "$fact" ]] || [[ "${existing_fact%%=*}" = "$fact" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Helper function to check if a system fact exists and return its value
+get_fact() {
+    local fact="$1"
+    for existing_fact in "${SYSTEM_STATE[@]}"; do
+        if [[ "${existing_fact%%=*}" = "$fact" ]]; then
+            echo "${existing_fact#*=}"
+            return 0
+        elif [[ "$existing_fact" = "$fact" ]]; then
+            echo ""
             return 0
         fi
     done
@@ -721,7 +763,7 @@ plan_setup_tasks() {
     fi
 
     # Configure MinIO (needed for be-BOP config)
-    if ! has_fact "minio_config_exists" || ! has_fact "minio_correctly_configured"; then
+    if ! has_fact "minio_config_exists" || has_fact "minio_config_domain_mismatch"; then
         TASK_PLAN+=("write_minio_configuration")
         if has_fact "minio_running"; then
             TASK_PLAN+=("restart_minio")
@@ -737,7 +779,7 @@ plan_setup_tasks() {
     fi
 
     # Generate be-BOP configuration (needs MinIO credentials)
-    if ! has_fact "bebop_config_exists" || ! has_fact "bebop_correctly_configured"; then
+    if ! has_fact "bebop_config_exists" || has_fact "bebop_config_domain_mismatch"; then
         TASK_PLAN+=("write_bebop_configuration")
     fi
 
@@ -759,16 +801,25 @@ plan_setup_tasks() {
     fi
 
     # Smart cascading logic for nginx and be-BOP site
-    if ! has_fact "bebop_site_running" || ! has_fact "bebop_site_correctly_configured"; then
-        TASK_PLAN+=("configure_bebop_site")
-
-        if ! has_fact "nginx_running"; then
-            TASK_PLAN+=("start_and_enable_nginx")
+    if ! has_fact "bebop_site_running" || has_fact "bebop_nginx_site_domain_mismatch"; then
+        if has_fact "bebop_nginx_site_domain_mismatch"; then
+            TASK_PLAN+=("configure_bebop_site")
+        elif ! has_fact "specified_domain" && has_fact "bebop_site_enabled" && has_fact "nginx_running"; then
+            log_debug "nginx is running with be-BOP site enabled: Assuming no-need to reconfigure nginx."
         else
-            TASK_PLAN+=("reload_nginx")
+            TASK_PLAN+=("configure_bebop_site")
         fi
 
-        if [[ "$DOMAIN" != "localhost" ]]; then
+        if [[ "${TASK_PLAN[*]}" =~ "configure_bebop_site" ]]; then
+            if ! has_fact "nginx_running"; then
+                TASK_PLAN+=("start_and_enable_nginx")
+            else
+                TASK_PLAN+=("reload_nginx")
+            fi
+        fi
+
+        local domain
+        if domain="$(get_fact "specified_domain")" && [[ "$domain" != "localhost" ]]; then
             TASK_PLAN+=("provision_ssl_cert")
         fi
     fi
@@ -800,9 +851,71 @@ plan_setup_tasks() {
 
     if ! has_fact "bebop_running"; then
         TASK_PLAN+=("start_and_enable_bebop")
+    elif [[ "${TASK_PLAN[*]}" =~ "write_bebop_configuration" ]]; then
+        TASK_PLAN+=("restart_bebop")
     fi
 
     log_debug "Planned actions: ${TASK_PLAN[*]}"
+}
+
+check_missing_flags() {
+    export REQUIRED_FLAGS=()
+    export TASKS_REQUIRING_FLAGS=()
+    for task in "${TASK_PLAN[@]}"; do
+        case "$task" in
+            "configure_bebop_site"|"write_bebop_configuration"|"write_minio_configuration")
+                if ! has_fact "specified_domain"; then
+                    REQUIRED_FLAGS+=("domain")
+                    TASKS_REQUIRING_FLAGS+=("$task")
+                fi
+                ;;
+            "provision_ssl_cert")
+                if ! has_fact "specified_domain"; then
+                    REQUIRED_FLAGS+=("domain")
+                    TASKS_REQUIRING_FLAGS+=("$task")
+                fi
+                if ! has_fact "specified_email"; then
+                    REQUIRED_FLAGS+=("email")
+                    TASKS_REQUIRING_FLAGS+=("$task")
+                fi
+                ;;
+            *)
+                ;;
+        esac
+    done
+    local deduplicated=($(printf '%s\n' "${REQUIRED_FLAGS[@]}" | sort -u))
+    REQUIRED_FLAGS=("${deduplicated[@]}")
+
+    if [ ${#REQUIRED_FLAGS[@]} -gt 0 ]; then
+        return 1
+    fi
+}
+
+handle_missing_flags() {
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "💡 The script paused safely — we need a bit more information to start."
+    echo ""
+    echo "To move forward, please include the following flag(s):"
+    for flag in "${REQUIRED_FLAGS[@]}"; do
+        echo "   • --${flag}"
+    done
+    echo ""
+    echo "The following steps are waiting for that info:"
+    for task in "${TASKS_REQUIRING_FLAGS[@]}"; do
+        echo "   • $(describe_task "$task")"
+    done
+    echo ""
+    echo "👉 Example:"
+    echo "   $(basename "${0:-be-bop-wizard}") --${REQUIRED_FLAGS[0]} <value>"
+    echo ""
+    echo "🪪 Need a hand or want to share feedback?"
+    echo "   - Email: contact@be-bop.io"
+    echo "   - Nostr: npub16l9pnrkhhagkucjhxvvztz2czv9ex8s5u7yg80ghw9ccjp4j25pqaku4ha"
+    echo ""
+    echo "Once you add the missing flag(s), just re-run the script — it’ll pick up right it left off."
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    exit 1
 }
 
 list_tools_for_task() {
@@ -881,14 +994,14 @@ summarize_state_and_plan() {
     }
 
     nginx_state() {
-        if has_fact "nginx_running" && has_fact "bebop_site_running" && has_fact "bebop_site_correctly_configured"; then
-            echo "✓ running with be-BOP site correctly configured for $DOMAIN"
-        elif has_fact "nginx_running" && has_fact "bebop_site_running" && has_fact "bebop_site_enabled"; then
-            echo "⚠ running but site configured for different domain (needs reconfiguration)"
+        if has_fact "bebop_nginx_site_domain_mismatch"; then
+            echo "⚠ be-BOP site configured for different domain (needs reconfiguration)"
+        elif has_fact "nginx_running" && has_fact "bebop_site_running"; then
+            echo "✓ be-BOP site running"
         elif has_fact "nginx_running" && has_fact "bebop_site_enabled"; then
-            echo "⚠ running but be-BOP site not responding"
+            echo "✓ be-BOP site enabled"
         elif has_fact "nginx_running"; then
-            echo "⚠ running but be-BOP site not configured"
+            echo "⚠ installed but not running"
         elif has_fact "nginx_installed"; then
             echo "⚠ installed but not running"
         else
@@ -907,10 +1020,10 @@ summarize_state_and_plan() {
     }
 
     minio_state() {
-        if has_fact "minio_running" && has_fact "minio_correctly_configured"; then
-            echo "✓ running and correctly configured for s3.$DOMAIN"
+        if has_fact "minio_config_domain_mismatch"; then
+            echo "⚠ configured for different domain (needs reconfiguration)"
         elif has_fact "minio_running" && has_fact "minio_config_exists"; then
-            echo "⚠ running but configured for different domain (needs reconfiguration)"
+            echo "✓ running"
         elif has_fact "minio_running"; then
             echo "⚠ running but not configured"
         elif has_fact "minio_installed"; then
@@ -921,18 +1034,16 @@ summarize_state_and_plan() {
     }
 
     bebop_state() {
-        if has_fact "bebop_running" && has_fact "bebop_correctly_configured"; then
+        if has_fact "bebop_config_domain_mismatch"; then
+            echo "⚠ configured for different domain (needs reconfiguration)"
+        elif has_fact "bebop_running"; then
             if has_fact "bebop_latest_release_installed"; then
-                echo "✓ running, up-to-date and correctly configured for $DOMAIN"
+                echo "✓ up-to-date and running"
             elif [[ -z $LATEST_RELEASE_META ]]; then
                 echo "⚠ failed to fetch latest release information"
             else
-                echo "⚠ running and configured for $DOMAIN but a new release is available"
+                echo "⚠ a new release is available"
             fi
-        elif has_fact "bebop_running" && has_fact "bebop_config_exists"; then
-            echo "⚠ running but configured for different domain (needs reconfiguration)"
-        elif has_fact "bebop_running"; then
-            echo "⚠ running but not configured"
         elif has_fact "bebop_config_exists" && has_fact "bebop_service_exists"; then
             echo "⚠ service configured but not running"
         else
@@ -953,7 +1064,10 @@ summarize_state_and_plan() {
     }
 
     ssl_state() {
-        if [[ "$DOMAIN" = "localhost" ]]; then
+        local domain
+        if ! domain="$(get_fact "specified_domain")"; then
+            echo "⚪ unknown (run with --domain <domain> to check)"
+        elif [[ "$domain" = "localhost" ]]; then
             echo "⚪ not needed (localhost)"
         elif has_fact "certbot_installed"; then
             echo "✓ Let's Encrypt available"
@@ -976,8 +1090,13 @@ summarize_state_and_plan() {
     echo "=========================================="
     echo "be-BOP Installation Plan"
     echo "=========================================="
-    echo "Domain: $DOMAIN"
-    echo "Email: $EMAIL"
+    local domain email
+    if domain="$(get_fact "specified_domain")"; then
+        echo "Domain: $domain"
+    fi
+    if email="$(get_fact "specified_email")"; then
+        echo "Email: $email"
+    fi
     echo "Environment: $DETECTED_OS $DETECTED_VERSION"
     echo ""
 
@@ -1054,7 +1173,7 @@ prepare_toolbox() {
 describe_task() {
     case "$1" in
         "configure_bebop_hardening_overrides") echo "Apply security hardening to be-BOP service" ;;
-        "configure_bebop_site") echo "Configure be-BOP nginx site for $DOMAIN" ;;
+        "configure_bebop_site") echo "Configure be-BOP nginx site" ;;
         "configure_minio_hardening_overrides") echo "Apply security hardening to MinIO service" ;;
         "configure_mongodb_repo") echo "Configure MongoDB 8.0 repository" ;;
         "configure_nodejs_repo") echo "Configure Node.js 22 repository" ;;
@@ -1078,8 +1197,8 @@ describe_task() {
         "start_and_enable_mongodb") echo "Start and enable MongoDB service" ;;
         "start_and_enable_nginx") echo "Start and enable nginx service" ;;
         "start_and_enable_phoenixd") echo "Start and enable phoenixd service" ;;
-        "write_bebop_configuration") echo "Generate be-BOP environment configuration for $DOMAIN" ;;
-        "write_minio_configuration") echo "Configure MinIO with generated credentials for $DOMAIN" ;;
+        "write_bebop_configuration") echo "Write be-BOP configuration" ;;
+        "write_minio_configuration") echo "Write MinIO configuration" ;;
         *) echo "Unknown action: $1" ;;
     esac
 }
@@ -1264,6 +1383,7 @@ initialize_mongodb_rs() {
 
 configure_bebop_site() {
     log_info "Configuring be-BOP nginx site..."
+    local domain="$(get_fact "specified_domain")"
 
     # Remove nginx default site
     run_privileged rm -f /etc/nginx/sites-enabled/default
@@ -1272,7 +1392,7 @@ configure_bebop_site() {
     # shellcheck disable=SC2064  # TMPDIR should be expanded here (and not on trap).
     trap "rm -rf $TMPDIR" RETURN 2>/dev/null || true
 
-    if [[ "$DOMAIN" = "localhost" ]]; then
+    if [[ "$domain" = "localhost" ]]; then
         # Localhost configuration (HTTP only)
         cat > "$TMPDIR/be-BOP.conf" << 'EOF'
 # The sites in this file are managed by be-bop-wizard
@@ -1318,7 +1438,7 @@ server {
 EOF
     else
         # Production configuration with HTTPS
-        sed "s/example.com/${DOMAIN}/g" > "$TMPDIR/be-BOP.conf" << 'EOF'
+        sed "s/example.com/${domain}/g" > "$TMPDIR/be-BOP.conf" << 'EOF'
 # The sites in this file are managed by be-bop-wizard
 
 server {
@@ -1427,7 +1547,9 @@ reload_nginx() {
 
 provision_ssl_cert() {
     log_info "Provisioning SSL certificate with Let's Encrypt..."
-    run_privileged certbot --nginx -d "${DOMAIN}" -d "s3.${DOMAIN}" --non-interactive --agree-tos --email "${EMAIL}"
+    local domain="$(get_fact "specified_domain")"
+    local email="$(get_fact "specified_email")"
+    run_privileged certbot --nginx -d "${domain}" -d "s3.${domain}" --non-interactive --agree-tos --email "${email}"
 }
 
 install_phoenixd() {
@@ -1513,6 +1635,7 @@ install_minio() {
 
 write_minio_configuration() {
     log_info "Configuring MinIO with generated credentials..."
+    local domain="$(get_fact "specified_domain")"
 
     local TMPDIR=$(mktemp -d)
     # shellcheck disable=SC2064  # TMPDIR should be expanded here (and not on trap).
@@ -1522,17 +1645,17 @@ write_minio_configuration() {
     if [[ -f /etc/minio/config.env ]]; then
         log_debug "Patching domain in existing MinIO configuration"
         cp /etc/minio/config.env "$TMPDIR/config.env"
-        sed -i "s|^MINIO_SERVER_URL=.*|MINIO_SERVER_URL=https://s3.${DOMAIN}|" "$TMPDIR/config.env"
+        sed -i "s|^MINIO_SERVER_URL=.*|MINIO_SERVER_URL=https://s3.${domain}|" "$TMPDIR/config.env"
     else
         # Create new configuration with generated credentials
         cat > "$TMPDIR/config.env" << EOF
 MINIO_ROOT_USER=$(openssl rand -base64 63 | tr -d '\n')
 MINIO_ROOT_PASSWORD=$(openssl rand -base64 63 | tr -d '\n')
-MINIO_SERVER_URL=https://s3.${DOMAIN}
+MINIO_SERVER_URL=https://s3.${domain}
 EOF
     fi
 
-    if [[ "$DOMAIN" = "localhost" ]]; then
+    if [[ "$domain" = "localhost" ]]; then
         # Don't use https for localhost
         sed -i 's|MINIO_SERVER_URL=https://|MINIO_SERVER_URL=http://|' "$TMPDIR/config.env"
     fi
@@ -1549,6 +1672,7 @@ EOF
 
 write_bebop_configuration() {
     log_info "Generating be-BOP environment configuration..."
+    local domain="$(get_fact "specified_domain")"
 
     # Read MinIO credentials from config file
     local S3_ROOT_USER=$(run_privileged grep '^MINIO_ROOT_USER=' /etc/minio/config.env 2>/dev/null | cut -d'=' -f2- || echo "")
@@ -1568,8 +1692,8 @@ write_bebop_configuration() {
 ADDRESS_HEADER=X-Forwarded-For
 MONGODB_DB=bebop
 MONGODB_URL=mongodb://127.0.0.1:27017
-ORIGIN=https://${DOMAIN}
-PUBLIC_S3_ENDPOINT_URL=https://s3.${DOMAIN}
+ORIGIN=https://${domain}
+PUBLIC_S3_ENDPOINT_URL=https://s3.${domain}
 S3_BUCKET=bebop
 S3_ENDPOINT_URL=http://127.0.0.1:9000
 S3_KEY_ID=${S3_ROOT_USER}
@@ -1580,7 +1704,7 @@ XFF_DEPTH=1
 # Put your custom configuration (with new environment variables) after this line
 EOF
 
-    if [[ "$DOMAIN" = "localhost" ]]; then
+    if [[ "$domain" = "localhost" ]]; then
         # Don't use https for localhost
         sed -i 's|ORIGIN=https://|ORIGIN=http://|' "$TMPDIR/config.env"
         sed -i 's|PUBLIC_S3_ENDPOINT_URL=https://|PUBLIC_S3_ENDPOINT_URL=http://|' "$TMPDIR/config.env"
@@ -2017,12 +2141,15 @@ show_phoenixd_information() {
 # which are running, and where to look if something went wrong.
 # Think of it as the "mission debrief" — a clear final status for operators.
 summarize_results() {
+    local domain
     log_info "Installation completed successfully!"
     echo ""
     echo "=========================================="
     echo "be-BOP Installation Complete!"
     echo "=========================================="
-    echo "Your be-BOP instance should be accessible at: https://$DOMAIN"
+    if domain="$(get_fact "specified_domain")"; then
+        echo "Your be-BOP instance should be accessible at: https://$domain"
+    fi
     echo ""
 
     if [[ "${TASK_PLAN[*]}" =~ "install_phoenixd" ]] || [[ "${TASK_PLAN[*]}" =~ "install_phoenixd_service" ]]; then
@@ -2063,6 +2190,10 @@ main() {
     if [[ ${#TASK_PLAN[@]} -eq 0 ]]; then
         log_info "Nothing to do. Exiting."
         exit $EXIT_SUCCESS
+    fi
+
+    if ! check_missing_flags; then
+        handle_missing_flags
     fi
 
     if [ "$DRY_RUN" = true ]; then
