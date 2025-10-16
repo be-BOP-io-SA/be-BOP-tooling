@@ -1,0 +1,70 @@
+name: Check Script Version Update
+
+on:
+  pull_request:
+    paths:
+      - "be-bop-wizard/be-bop-wizard.sh"
+
+jobs:
+  check-wizard-version-updated:
+    name: Check Wizard Version Updated
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fetch base branch
+        run: |
+          git fetch origin ${{ github.event.pull_request.base.ref }}:${{ github.event.pull_request.base.ref }}
+      - name: Check if SCRIPT_VERSION was updated in every commit
+        run: |
+          set -eEuo pipefail
+          versions=()
+          check_failed=false
+          file="be-bop-wizard/be-bop-wizard.sh"
+
+          echo "Checking SCRIPT_VERSION updates in commits that updated $file"
+          for ref in $(git rev-list ${{ github.event.pull_request.base.ref }}..HEAD | tac); do
+            if [[ -n "$(git show "$ref" "$file")" ]]; then
+              version="$(git show "$ref" "$file" | grep -oP '^\+readonly SCRIPT_VERSION="\K[^"]+' || true)"
+              if [[ -n "$version" ]]; then
+                echo "$ref: ✅ SCRIPT_VERSION updated to version $version"
+                versions+=("$version")
+              else
+                echo "$ref: ❌ SCRIPT_VERSION not updated"
+                check_failed=true
+              fi
+            fi
+          done
+          echo ""
+
+          # Check if versions are strictly increasing
+          sorted=$(printf '%s\n' "${versions[@]}" | sort -V)
+          unsorted=$(printf '%s\n' "${versions[@]}")
+          if [[ "$sorted" = "$unsorted" ]]; then
+            echo "✅ Versions are sorted in increasing order."
+          else
+            echo "❌ Versions are not sorted in increasing order."
+            check_failed=true
+          fi
+          echo ""
+
+          if [[ "$check_failed" = true ]]; then
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "💡 Version check failed for $file"
+            echo ""
+            echo "This usually means one of the following:"
+            echo "  • SCRIPT_VERSION was not updated in one or more commits that modified the script."
+            echo "  • SCRIPT_VERSION values are not strictly increasing (e.g. a version was reused or decreased)."
+            echo ""
+            echo "✅ To fix this:"
+            echo "  1. Make sure each commit updating ${file} also updates the SCRIPT_VERSION line."
+            echo "  2. Use monotonically increasing versions (e.g. 2025101601 → 2025101602)."
+            echo ""
+            echo "After correcting the versions, push the updated commits to rerun this check."
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo ""
+            exit 1
+          fi
