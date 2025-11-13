@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.3.3"
+readonly SCRIPT_VERSION="2.3.4"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -1276,6 +1276,38 @@ check_options_required_by_planned_tasks_but_missing() {
 
     if [ ${#REQUIRED_OPTIONS[@]} -gt 0 ]; then
         die_missing_options
+    fi
+}
+
+check_cpu_features_required_by_planned_tasks() {
+    # Check if MongoDB will be started and verify AVX support
+    if [[ "${TASK_PLAN[*]}" =~ "start_and_enable_mongodb" ]]; then
+        log_debug "MongoDB service start is planned, checking CPU AVX instruction set support..."
+
+        if ! grep -q ' avx ' /proc/cpuinfo 2>/dev/null; then
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "💡 MongoDB requires a newer CPU with AVX instruction set support"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo ""
+            echo "Your server's CPU doesn't have AVX support, which MongoDB has required"
+            echo "since version 5 (released in 2021). This can happen for two reasons:"
+            echo ""
+            echo "   1. Your server has an older CPU that was built before AVX became standard"
+            echo "   2. Your hosting provider has disabled AVX in their virtualization settings"
+            echo ""
+            echo "This is a common issue with some low-cost hosting providers."
+            echo ""
+            echo "✨ What you can do:"
+            echo "   • Contact your hosting provider and ask if they can enable AVX support"
+            echo "   • Consider upgrading to a newer server or different hosting plan"
+            echo "   • Switch to a hosting provider that supports modern CPU features"
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            exit $EXIT_INCOMPATIBLE_SYSTEM_STATE
+        fi
+
+        log_debug "CPU has AVX instruction set support - MongoDB requirements satisfied"
     fi
 }
 
@@ -2669,6 +2701,7 @@ main() {
     fi
 
     check_options_required_by_planned_tasks_but_missing
+    check_cpu_features_required_by_planned_tasks
 
     if [ "$DRY_RUN" = true ]; then
         log_info "Exit before making any changes (--dry-run specified)."
