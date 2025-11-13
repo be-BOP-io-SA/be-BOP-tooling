@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.3.4"
+readonly SCRIPT_VERSION="2.3.5"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -1243,6 +1243,10 @@ plan_setup_tasks() {
         TASK_PLAN+=("restart_bebop")
     fi
 
+    if [[ "${TASK_PLAN[*]}" =~ "start_and_enable_bebop" ]] || [[ "${TASK_PLAN[*]}" =~ "restart_bebop" ]]; then
+        TASK_PLAN+=("await_bebop_ready")
+    fi
+
     log_debug "Planned actions: ${TASK_PLAN[*]}"
 }
 
@@ -1645,6 +1649,7 @@ prepare_toolbox() {
 # instead of just seeing raw function names.
 describe_task() {
     case "$1" in
+        "await_bebop_ready") echo "Wait for be-BOP service to be ready" ;;
         "configure_bebop_hardening_overrides") echo "Apply security hardening to be-BOP service" ;;
         "configure_bebop_site") echo "Configure be-BOP nginx site" ;;
         "configure_minio_hardening_overrides") echo "Apply security hardening to MinIO service" ;;
@@ -1686,6 +1691,7 @@ describe_task() {
 # This is where the script actually changes the system to match the plan.
 run_task() {
     case "$1" in
+        "await_bebop_ready") task_await_bebop_ready ;;
         "configure_bebop_hardening_overrides") configure_bebop_hardening_overrides ;;
         "configure_bebop_site") configure_bebop_site ;;
         "configure_minio_hardening_overrides") configure_minio_hardening_overrides ;;
@@ -2524,6 +2530,48 @@ start_and_enable_bebop() {
 restart_bebop() {
     log_info "Restarting be-BOP service..."
     run_privileged systemctl restart bebop
+}
+
+task_await_bebop_ready() {
+    log_info "Waiting for be-BOP service to be ready..."
+    local domain="$(get_fact "specified_domain")"
+    local retries="$SERVICE_TEST_START_RETRIES"
+    local test_url curl_args=()
+
+    # Configure URL and curl arguments based on domain
+    if [[ "$domain" = "localhost" ]]; then
+        test_url="http://localhost/.well-known/version.txt"
+    else
+        test_url="https://localhost/.well-known/version.txt"
+        curl_args+=("-H" "Host: $domain" "-k")  # -k to ignore self-signed cert issues
+    fi
+
+    # Add common curl arguments
+    curl_args+=(
+        "--connect-timeout" "$CURL_CONNECT_TIMEOUT"
+        "--max-time" "$CURL_DOWNLOAD_TIMEOUT"
+        "--silent"
+        "--show-error"
+        "--location"  # Follow redirections
+        "--write-out" "%{http_code}"
+        "--output" "/dev/null"
+    )
+
+    while true; do
+        local http_code
+        if http_code="$(curl "${curl_args[@]}" "$test_url" 2>/dev/null)" && [[ "$http_code" = "200" ]]; then
+            log_info "be-BOP service is ready and responding"
+            return 0
+        fi
+
+        if [[ $retries -le 0 ]]; then
+            die $EXIT_ERROR $LINENO "be-BOP service failed to become ready after $((SERVICE_TEST_START_RETRIES * SERVICE_TEST_START_WAIT_SECONDS)) seconds"
+        fi
+
+        log_debug "Waiting for be-BOP to be ready... ($retries retries left, HTTP code: ${http_code:-'connection failed'})"
+        sleep "$SERVICE_TEST_START_WAIT_SECONDS"
+        ((retries--))
+    done
 }
 
 install_bebop_latest_release() {
