@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.3.2"
+readonly SCRIPT_VERSION="2.3.3"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -513,7 +513,7 @@ is_systemd_operational() {
     state=$(systemctl is-system-running 2>/dev/null || true)
 
     case "$state" in
-        running|degraded) return 0 ;;  # good enough
+        initializing|starting|running|degraded|maintenance) return 0 ;;  # good enough
         *) return 1 ;;
     esac
 }
@@ -1030,6 +1030,42 @@ die_unsupported_os_distribution_for_tasks() {
     exit "$EXIT_INCOMPATIBLE_SYSTEM_STATE"
 }
 
+die_systemd_unavailable_for_task() {
+    local task="$1"
+    local systemd_state="$2"
+    local description
+    if description="$(describe_task "$task")"; then
+        log_error "systemd is required for task '$task' ($description)."
+    else
+        log_error "systemd is required for task '$task'."
+    fi
+    log_error "The wizard tried to wait for systemd to be ready but couldn't confirm it's ready."
+    log_error "systemd reported state '$systemd_state'."
+    log_error "The script paused to prevent any potential issues."
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "💡 The wizard stopped safely — your system may not be ready for service management."
+    echo ""
+    echo "This typically happens when your system is:"
+    echo "   • Shutting down or restarting"
+    echo "   • Preparing to sleep or hibernate"
+    echo "   • In an emergency or recovery state"
+    echo ""
+    echo "You can try these options:"
+    echo "   1. Wait a few minutes and try running the wizard again"
+    echo "   2. Restart your system and try again once it's fully booted"
+    echo ""
+    echo "If your system seems normal and this keeps happening, please reach out — we'd"
+    echo "like to help figure out what's going on."
+    echo ""
+    echo "🪪 Contact options:"
+    echo "   - Email: contact@be-bop.io"
+    echo "   - Nostr: npub16l9pnrkhhagkucjhxvvztz2czv9ex8s5u7yg80ghw9ccjp4j25pqaku4ha"
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    exit "$EXIT_INCOMPATIBLE_SYSTEM_STATE"
+}
+
 check_os_supported_by_wizard() {
     local unsupported_tasks=()
 
@@ -1069,24 +1105,8 @@ check_os_supported_by_wizard() {
             unsupported_tasks+=("$task")
         fi
     done
-    local tasks_requiring_systemd_operational=(
-        "configure_bebop_hardening_overrides"
-        "configure_minio_hardening_overrides"
-        "configure_phoenixd_hardening_overrides"
-        "initialize_mongodb_rs"
-        "install_bebop_service"
-        "install_minio_service"
-        "install_phoenixd_service"
-        "reload_nginx"
-        "restart_bebop"
-        "restart_minio"
-        "start_and_enable_bebop"
-        "start_and_enable_minio"
-        "start_and_enable_nginx"
-        "start_and_enable_phoenixd"
-    )
-    for task in "${tasks_requiring_systemd_operational[@]}"; do
-        if [[ "${TASK_PLAN[*]}" =~ "$task" ]] && ! has_fact systemd_operational; then
+    for task in "${TASK_PLAN[@]}"; do
+        if task_requires_systemd_operational "$task" && ! has_fact systemd_operational; then
             unsupported_tasks+=("$task")
         fi
     done
@@ -1518,6 +1538,54 @@ prompt_user_confirmation() {
             exit $EXIT_SUCCESS
             ;;
     esac
+}
+
+# Returns 1 when the task does not require systemd operational
+task_requires_systemd_operational() {
+    case "$1" in
+        configure_bebop_hardening_overrides) ;;
+        configure_minio_hardening_overrides) ;;
+        configure_phoenixd_hardening_overrides) ;;
+        initialize_mongodb_rs) ;;
+        install_bebop_service) ;;
+        install_minio_service) ;;
+        install_phoenixd_service) ;;
+        reload_nginx) ;;
+        restart_bebop) ;;
+        restart_minio) ;;
+        start_and_enable_bebop) ;;
+        start_and_enable_minio) ;;
+        start_and_enable_nginx) ;;
+        start_and_enable_phoenixd) ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+wait_systemd_operational() {
+    local state
+    state=$(systemctl is-system-running --wait 2>/dev/null || true)
+    case "$state" in
+        running|degraded)  # good enough
+            ;;
+        *)
+            die_systemd_unavailable_for_task "$task" "$state"
+            ;;
+    esac
+}
+
+execute_task_plan() {
+    log_info "Executing planned tasks..."
+    local systemd_operational=false
+    for task in "${TASK_PLAN[@]}"; do
+        if [[ "$systemd_operational" != true ]] && task_requires_systemd_operational "$task"; then
+            wait_systemd_operational
+            systemd_operational=true
+        fi
+        log_info "Running task: $task"
+        run_task "$task"
+    done
 }
 
 update_package_lists() {
@@ -2611,10 +2679,7 @@ main() {
 
     log_info "Beginning installation..."
     prepare_toolbox
-    for action in "${TASK_PLAN[@]}"; do
-        log_info "Executing: $(describe_task "$action")"
-        run_task "$action"
-    done
+    execute_task_plan
 
     summarize_results
 }
