@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.3.5"
+readonly SCRIPT_VERSION="2.3.6"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -954,7 +954,7 @@ die_unsupported_os_distribution_for_tasks() {
     local distro_name="${DETECTED_HUMAN_OS_DISTRIBUTION:-}"
     local comment=""
     if ! has_fact systemd_operational; then
-        comment="(systemd not operational)"
+        comment="(without systemd)"
     fi
 
     local task_descriptions=()
