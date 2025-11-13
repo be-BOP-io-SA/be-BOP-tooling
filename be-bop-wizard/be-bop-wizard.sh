@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.3.1"
+readonly SCRIPT_VERSION="2.3.2"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -60,8 +60,8 @@ readonly EXIT_INCOMPATIBLE_SYSTEM_STATE=2
 readonly EXIT_USER_ABORT=3
 
 # Network and timeout constants
-readonly CURL_CONNECT_TIMEOUT=${CURL_CONNECT_TIMEOUT:-5}
-readonly CURL_DOWNLOAD_TIMEOUT=${CURL_DOWNLOAD_TIMEOUT:-300}
+readonly CURL_CONNECT_TIMEOUT=${CURL_CONNECT_TIMEOUT:-30}
+readonly CURL_DOWNLOAD_TIMEOUT=${CURL_DOWNLOAD_TIMEOUT:-600}
 readonly SERVICE_TEST_START_RETRIES=10
 readonly SERVICE_TEST_START_WAIT_SECONDS=3
 
