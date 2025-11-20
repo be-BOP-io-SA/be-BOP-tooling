@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.3.1"
+readonly SCRIPT_VERSION="2.3.6"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -60,8 +60,8 @@ readonly EXIT_INCOMPATIBLE_SYSTEM_STATE=2
 readonly EXIT_USER_ABORT=3
 
 # Network and timeout constants
-readonly CURL_CONNECT_TIMEOUT=${CURL_CONNECT_TIMEOUT:-5}
-readonly CURL_DOWNLOAD_TIMEOUT=${CURL_DOWNLOAD_TIMEOUT:-300}
+readonly CURL_CONNECT_TIMEOUT=${CURL_CONNECT_TIMEOUT:-30}
+readonly CURL_DOWNLOAD_TIMEOUT=${CURL_DOWNLOAD_TIMEOUT:-600}
 readonly SERVICE_TEST_START_RETRIES=10
 readonly SERVICE_TEST_START_WAIT_SECONDS=3
 
@@ -513,7 +513,7 @@ is_systemd_operational() {
     state=$(systemctl is-system-running 2>/dev/null || true)
 
     case "$state" in
-        running|degraded) return 0 ;;  # good enough
+        initializing|starting|running|degraded|maintenance) return 0 ;;  # good enough
         *) return 1 ;;
     esac
 }
@@ -954,7 +954,7 @@ die_unsupported_os_distribution_for_tasks() {
     local distro_name="${DETECTED_HUMAN_OS_DISTRIBUTION:-}"
     local comment=""
     if ! has_fact systemd_operational; then
-        comment="(systemd not operational)"
+        comment="(without systemd)"
     fi
 
     local task_descriptions=()
@@ -1030,6 +1030,42 @@ die_unsupported_os_distribution_for_tasks() {
     exit "$EXIT_INCOMPATIBLE_SYSTEM_STATE"
 }
 
+die_systemd_unavailable_for_task() {
+    local task="$1"
+    local systemd_state="$2"
+    local description
+    if description="$(describe_task "$task")"; then
+        log_error "systemd is required for task '$task' ($description)."
+    else
+        log_error "systemd is required for task '$task'."
+    fi
+    log_error "The wizard tried to wait for systemd to be ready but couldn't confirm it's ready."
+    log_error "systemd reported state '$systemd_state'."
+    log_error "The script paused to prevent any potential issues."
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "💡 The wizard stopped safely — your system may not be ready for service management."
+    echo ""
+    echo "This typically happens when your system is:"
+    echo "   • Shutting down or restarting"
+    echo "   • Preparing to sleep or hibernate"
+    echo "   • In an emergency or recovery state"
+    echo ""
+    echo "You can try these options:"
+    echo "   1. Wait a few minutes and try running the wizard again"
+    echo "   2. Restart your system and try again once it's fully booted"
+    echo ""
+    echo "If your system seems normal and this keeps happening, please reach out — we'd"
+    echo "like to help figure out what's going on."
+    echo ""
+    echo "🪪 Contact options:"
+    echo "   - Email: contact@be-bop.io"
+    echo "   - Nostr: npub16l9pnrkhhagkucjhxvvztz2czv9ex8s5u7yg80ghw9ccjp4j25pqaku4ha"
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    exit "$EXIT_INCOMPATIBLE_SYSTEM_STATE"
+}
+
 check_os_supported_by_wizard() {
     local unsupported_tasks=()
 
@@ -1069,24 +1105,8 @@ check_os_supported_by_wizard() {
             unsupported_tasks+=("$task")
         fi
     done
-    local tasks_requiring_systemd_operational=(
-        "configure_bebop_hardening_overrides"
-        "configure_minio_hardening_overrides"
-        "configure_phoenixd_hardening_overrides"
-        "initialize_mongodb_rs"
-        "install_bebop_service"
-        "install_minio_service"
-        "install_phoenixd_service"
-        "reload_nginx"
-        "restart_bebop"
-        "restart_minio"
-        "start_and_enable_bebop"
-        "start_and_enable_minio"
-        "start_and_enable_nginx"
-        "start_and_enable_phoenixd"
-    )
-    for task in "${tasks_requiring_systemd_operational[@]}"; do
-        if [[ "${TASK_PLAN[*]}" =~ "$task" ]] && ! has_fact systemd_operational; then
+    for task in "${TASK_PLAN[@]}"; do
+        if task_requires_systemd_operational "$task" && ! has_fact systemd_operational; then
             unsupported_tasks+=("$task")
         fi
     done
@@ -1223,6 +1243,10 @@ plan_setup_tasks() {
         TASK_PLAN+=("restart_bebop")
     fi
 
+    if [[ "${TASK_PLAN[*]}" =~ "start_and_enable_bebop" ]] || [[ "${TASK_PLAN[*]}" =~ "restart_bebop" ]]; then
+        TASK_PLAN+=("await_bebop_ready")
+    fi
+
     log_debug "Planned actions: ${TASK_PLAN[*]}"
 }
 
@@ -1256,6 +1280,38 @@ check_options_required_by_planned_tasks_but_missing() {
 
     if [ ${#REQUIRED_OPTIONS[@]} -gt 0 ]; then
         die_missing_options
+    fi
+}
+
+check_cpu_features_required_by_planned_tasks() {
+    # Check if MongoDB will be started and verify AVX support
+    if [[ "${TASK_PLAN[*]}" =~ "start_and_enable_mongodb" ]]; then
+        log_debug "MongoDB service start is planned, checking CPU AVX instruction set support..."
+
+        if ! grep -q ' avx ' /proc/cpuinfo 2>/dev/null; then
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo "💡 MongoDB requires a newer CPU with AVX instruction set support"
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo ""
+            echo "Your server's CPU doesn't have AVX support, which MongoDB has required"
+            echo "since version 5 (released in 2021). This can happen for two reasons:"
+            echo ""
+            echo "   1. Your server has an older CPU that was built before AVX became standard"
+            echo "   2. Your hosting provider has disabled AVX in their virtualization settings"
+            echo ""
+            echo "This is a common issue with some low-cost hosting providers."
+            echo ""
+            echo "✨ What you can do:"
+            echo "   • Contact your hosting provider and ask if they can enable AVX support"
+            echo "   • Consider upgrading to a newer server or different hosting plan"
+            echo "   • Switch to a hosting provider that supports modern CPU features"
+            echo ""
+            echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            exit $EXIT_INCOMPATIBLE_SYSTEM_STATE
+        fi
+
+        log_debug "CPU has AVX instruction set support - MongoDB requirements satisfied"
     fi
 }
 
@@ -1520,6 +1576,54 @@ prompt_user_confirmation() {
     esac
 }
 
+# Returns 1 when the task does not require systemd operational
+task_requires_systemd_operational() {
+    case "$1" in
+        configure_bebop_hardening_overrides) ;;
+        configure_minio_hardening_overrides) ;;
+        configure_phoenixd_hardening_overrides) ;;
+        initialize_mongodb_rs) ;;
+        install_bebop_service) ;;
+        install_minio_service) ;;
+        install_phoenixd_service) ;;
+        reload_nginx) ;;
+        restart_bebop) ;;
+        restart_minio) ;;
+        start_and_enable_bebop) ;;
+        start_and_enable_minio) ;;
+        start_and_enable_nginx) ;;
+        start_and_enable_phoenixd) ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+wait_systemd_operational() {
+    local state
+    state=$(systemctl is-system-running --wait 2>/dev/null || true)
+    case "$state" in
+        running|degraded)  # good enough
+            ;;
+        *)
+            die_systemd_unavailable_for_task "$task" "$state"
+            ;;
+    esac
+}
+
+execute_task_plan() {
+    log_info "Executing planned tasks..."
+    local systemd_operational=false
+    for task in "${TASK_PLAN[@]}"; do
+        if [[ "$systemd_operational" != true ]] && task_requires_systemd_operational "$task"; then
+            wait_systemd_operational
+            systemd_operational=true
+        fi
+        log_info "Running task: $task"
+        run_task "$task"
+    done
+}
+
 update_package_lists() {
     log_info "Updating package list..."
     run_privileged apt update
@@ -1545,6 +1649,7 @@ prepare_toolbox() {
 # instead of just seeing raw function names.
 describe_task() {
     case "$1" in
+        "await_bebop_ready") echo "Wait for be-BOP service to be ready" ;;
         "configure_bebop_hardening_overrides") echo "Apply security hardening to be-BOP service" ;;
         "configure_bebop_site") echo "Configure be-BOP nginx site" ;;
         "configure_minio_hardening_overrides") echo "Apply security hardening to MinIO service" ;;
@@ -1586,6 +1691,7 @@ describe_task() {
 # This is where the script actually changes the system to match the plan.
 run_task() {
     case "$1" in
+        "await_bebop_ready") task_await_bebop_ready ;;
         "configure_bebop_hardening_overrides") configure_bebop_hardening_overrides ;;
         "configure_bebop_site") configure_bebop_site ;;
         "configure_minio_hardening_overrides") configure_minio_hardening_overrides ;;
@@ -2426,6 +2532,48 @@ restart_bebop() {
     run_privileged systemctl restart bebop
 }
 
+task_await_bebop_ready() {
+    log_info "Waiting for be-BOP service to be ready..."
+    local domain="$(get_fact "specified_domain")"
+    local retries="$SERVICE_TEST_START_RETRIES"
+    local test_url curl_args=()
+
+    # Configure URL and curl arguments based on domain
+    if [[ "$domain" = "localhost" ]]; then
+        test_url="http://localhost/.well-known/version.txt"
+    else
+        test_url="https://localhost/.well-known/version.txt"
+        curl_args+=("-H" "Host: $domain" "-k")  # -k to ignore self-signed cert issues
+    fi
+
+    # Add common curl arguments
+    curl_args+=(
+        "--connect-timeout" "$CURL_CONNECT_TIMEOUT"
+        "--max-time" "$CURL_DOWNLOAD_TIMEOUT"
+        "--silent"
+        "--show-error"
+        "--location"  # Follow redirections
+        "--write-out" "%{http_code}"
+        "--output" "/dev/null"
+    )
+
+    while true; do
+        local http_code
+        if http_code="$(curl "${curl_args[@]}" "$test_url" 2>/dev/null)" && [[ "$http_code" = "200" ]]; then
+            log_info "be-BOP service is ready and responding"
+            return 0
+        fi
+
+        if [[ $retries -le 0 ]]; then
+            die $EXIT_ERROR $LINENO "be-BOP service failed to become ready after $((SERVICE_TEST_START_RETRIES * SERVICE_TEST_START_WAIT_SECONDS)) seconds"
+        fi
+
+        log_debug "Waiting for be-BOP to be ready... ($retries retries left, HTTP code: ${http_code:-'connection failed'})"
+        sleep "$SERVICE_TEST_START_WAIT_SECONDS"
+        ((retries--))
+    done
+}
+
 install_bebop_latest_release() {
     log_info "Installing latest be-BOP release..."
 
@@ -2601,6 +2749,7 @@ main() {
     fi
 
     check_options_required_by_planned_tasks_but_missing
+    check_cpu_features_required_by_planned_tasks
 
     if [ "$DRY_RUN" = true ]; then
         log_info "Exit before making any changes (--dry-run specified)."
@@ -2611,10 +2760,7 @@ main() {
 
     log_info "Beginning installation..."
     prepare_toolbox
-    for action in "${TASK_PLAN[@]}"; do
-        log_info "Executing: $(describe_task "$action")"
-        run_task "$action"
-    done
+    execute_task_plan
 
     summarize_results
 }
