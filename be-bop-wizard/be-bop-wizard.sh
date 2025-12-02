@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.3.6"
+readonly SCRIPT_VERSION="2.3.7"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -314,6 +314,7 @@ DESCRIPTION:
 COMMON OPTIONS:
     --domain <FQDN>         Domain name for be-BOP installation
     --email <address>       Contact email for Let's Encrypt registration
+    --redirect-domain <FQDN>  Extra domain that redirects to main (repeatable)
 
 MORE OPTIONS:
     --allow-root            Allow running as root (discouraged)
@@ -335,6 +336,7 @@ EOF
 
 parse_cli_arguments() {
     export FULL_CMD_LINE=()
+    REDIRECT_DOMAINS=()
     while [[ $# -gt 0 ]]; do
         FULL_CMD_LINE+=("$1")
         case $1 in
@@ -369,6 +371,10 @@ parse_cli_arguments() {
             --non-interactive)
                 RUN_NON_INTERACTIVE=true
                 shift
+                ;;
+            --redirect-domain)
+                [[ $# -lt 2 ]] && die_missing_option_argument "--redirect-domain"
+                REDIRECT_DOMAINS+=("$2"); FULL_CMD_LINE+=("$2"); shift 2
                 ;;
             --verbose|-v)
                 VERBOSE=true
@@ -518,14 +524,18 @@ is_systemd_operational() {
     esac
 }
 
-bebop_config_wizard_fingerprint() {
+wizard_file_fingerprint() {
     # Unique identifier of the configuration template revision.
     # The wizard uses this value to compute the configuration fingerprint.
     # Increment it whenever the template’s structure of the be-BOP configuration
     # file change, so that different template generations can be distinguished
     # programmatically.
     # The value is currently internal, but may be exposed in the future.
-    local template_rev="2025101602"
+    local template_rev
+    case "${1:-bebop_config}" in
+        bebop_config) template_rev="2025101602" ;;
+        nginx_config) template_rev="2025112601" ;;
+    esac
     if command -v sha256sum >/dev/null 2>&1; then
         printf 'sha256:%s\n' "$(printf '%s' "$template_rev" | sha256sum | awk '{print $1}')"
     elif command -v sha256 >/dev/null 2>&1; then
@@ -554,6 +564,14 @@ inspect_system_state() {
 
     if [[ -n "${EMAIL:-}" ]]; then
         SYSTEM_STATE+=("specified_email=${EMAIL}")
+    fi
+
+    # Compute derived domain facts
+    if [[ -n "${DOMAIN:-}" ]]; then
+        local base="${DOMAIN#www.}" redir=("${REDIRECT_DOMAINS[@]:-}")
+        SYSTEM_STATE+=("bebop_domain=${DOMAIN}" "s3_domain=s3.${base}")
+        [[ "$DOMAIN" != "$base" ]] && redir+=("$base")
+        [[ ${#redir[@]} -gt 0 ]] && SYSTEM_STATE+=("redirect_domains=${redir[*]}")
     fi
 
     detect_os_information
@@ -656,6 +674,8 @@ inspect_system_state() {
 
     if [[ -L /etc/nginx/sites-enabled/be-BOP.conf ]] || [[ -f /etc/nginx/sites-enabled/be-BOP.conf ]]; then
         SYSTEM_STATE+=("bebop_site_enabled")
+        local nginx_fp="$(awk '/^# wizard-fingerprint:/{print $NF}' /etc/nginx/sites-available/be-BOP.conf 2>/dev/null)"
+        [[ -n "$nginx_fp" ]] && SYSTEM_STATE+=("nginx_config_fingerprint=${nginx_fp}")
 
         # Check if nginx site is correctly configured for this domain
         if ! validate_bebop_nginx_config_domains; then
@@ -802,7 +822,7 @@ validate_bebop_nginx_config_domains() {
     if [[ "$domain" = "localhost" ]]; then
         expected_domains="localhost s3.localhost"
     else
-        expected_domains="$domain s3.$domain"
+        expected_domains="$(domains_for_nginx)"
     fi
 
     for expected_domain in $expected_domains; do
@@ -810,6 +830,13 @@ validate_bebop_nginx_config_domains() {
             log_debug "nginx config missing domain: $expected_domain"
             return 1
         fi
+    done
+
+    # Check no extra domains exist
+    local actual
+    actual=$(grep -oE 'server_name[[:space:]]+[^;]+' /etc/nginx/sites-available/be-BOP.conf 2>/dev/null | sed 's/server_name[[:space:]]*//' | tr ' ' '\n' | sort -u)
+    for d in $actual; do
+        [[ " $expected_domains " == *" $d "* ]] || { log_debug "nginx config has extra domain: $d"; return 1; }
     done
 
     return 0
@@ -858,7 +885,7 @@ validate_bebop_config_domain() {
         expected_s3_url="http://s3.localhost"
     else
         expected_origin="https://$domain"
-        expected_s3_url="https://s3.$domain"
+        expected_s3_url="https://$(get_fact s3_domain)"
     fi
 
     if ! grep -q "^ORIGIN=$expected_origin$" /etc/be-BOP/config.env 2>/dev/null; then
@@ -872,6 +899,10 @@ validate_bebop_config_domain() {
     fi
 
     return 0
+}
+
+domains_for_nginx() {
+    echo "$(get_fact bebop_domain) $(get_fact s3_domain) $(get_fact redirect_domains 2>/dev/null || true)"
 }
 
 # Helper function to check if a tool is available
@@ -1200,6 +1231,13 @@ plan_setup_tasks() {
         fi
     fi
 
+    # Check if nginx config fingerprint changed
+    if has_fact nginx_config_fingerprint && \
+       [[ "$(get_fact nginx_config_fingerprint)" != "$(wizard_file_fingerprint nginx_config)" ]]; then
+        [[ ! "${TASK_PLAN[*]}" =~ configure_bebop_site ]] && TASK_PLAN+=("configure_bebop_site")
+        has_fact nginx_running && TASK_PLAN+=("reload_nginx")
+    fi
+
     if ! has_fact "phoenixd_running"; then
         if ! has_fact "phoenixd_installed"; then
             TASK_PLAN+=("install_phoenixd")
@@ -1232,7 +1270,7 @@ plan_setup_tasks() {
     elif ! has_fact "bebop_config_exists"; then
         # File does not exist
         TASK_PLAN+=("write_bebop_configuration")
-    elif [[ "$(get_fact bebop_config_exists)" != "$(bebop_config_wizard_fingerprint)" ]]; then
+    elif [[ "$(get_fact bebop_config_exists)" != "$(wizard_file_fingerprint bebop_config)" ]]; then
         # Config file was generated by a different schema
         TASK_PLAN+=("write_bebop_configuration")
     fi
@@ -1461,7 +1499,7 @@ summarize_state_and_plan() {
         if has_fact "bebop_config_domain_mismatch"; then
             echo "⚠ configured for different domain (needs reconfiguration)"
         elif has_fact "bebop_config_exists" && \
-            [[ "$(get_fact "bebop_config_exists")" != "$(bebop_config_wizard_fingerprint)" ]]; then
+            [[ "$(get_fact "bebop_config_exists")" != "$(wizard_file_fingerprint bebop_config)" ]]; then
             echo "⚠ configuration file is outdated"
         elif has_fact "bebop_running"; then
             if has_fact "bebop_latest_release_installed"; then
@@ -1520,6 +1558,7 @@ summarize_state_and_plan() {
     local domain email
     if domain="$(get_fact "specified_domain")"; then
         echo "Domain: $domain"
+        [[ "$domain" != "localhost" ]] && echo "  nginx: $(domains_for_nginx)"
     fi
     if email="$(get_fact "specified_email")"; then
         echo "Email: $email"
@@ -1879,8 +1918,9 @@ configure_bebop_site() {
 
     if [[ "$domain" = "localhost" ]]; then
         # Localhost configuration (HTTP only)
-        cat > "$TMPDIR/be-BOP.conf" << 'EOF'
+        awk -v fp="$(wizard_file_fingerprint nginx_config)" '{gsub(/@file_fingerprint@/, fp); print}' > "$TMPDIR/be-BOP.conf" << 'EOF'
 # The sites in this file are managed by be-bop-wizard
+# wizard-fingerprint: @file_fingerprint@
 server {
     listen 80;
     listen [::]:80;
@@ -1923,13 +1963,26 @@ server {
 EOF
     else
         # Production configuration with HTTPS
-        sed "s/example.com/${domain}/g" > "$TMPDIR/be-BOP.conf" << 'EOF'
+        local all_domains="$(domains_for_nginx)"
+
+        awk -v all_doms="$all_domains" \
+            -v main_dom="$domain" \
+            -v s3_dom="$(get_fact s3_domain)" \
+            -v fp="$(wizard_file_fingerprint nginx_config)" \
+            '{
+                gsub(/@http_to_https_domains@/, all_doms)
+                gsub(/@main_domain@/, main_dom)
+                gsub(/@s3_domain@/, s3_dom)
+                gsub(/@file_fingerprint@/, fp)
+                print
+            }' > "$TMPDIR/be-BOP.conf" << 'EOF'
 # The sites in this file are managed by be-bop-wizard
+# wizard-fingerprint: @file_fingerprint@
 
 server {
     listen 80;
     listen [::]:80;
-    server_name example.com s3.example.com;
+    server_name @http_to_https_domains@;
 
     location / {
         return 307 https://$host$request_uri;
@@ -1939,7 +1992,7 @@ server {
 server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
-    server_name example.com;
+    server_name @main_domain@;
 
     ssl_certificate     /etc/ssl/certs/ssl-cert-snakeoil.pem;
     ssl_certificate_key /etc/ssl/private/ssl-cert-snakeoil.key;
@@ -1970,7 +2023,7 @@ server {
 server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
-    server_name s3.example.com;
+    server_name @s3_domain@;
 
     ssl_certificate     /etc/ssl/certs/ssl-cert-snakeoil.pem;
     ssl_certificate_key /etc/ssl/private/ssl-cert-snakeoil.key;
@@ -2003,6 +2056,22 @@ server {
     }
 }
 EOF
+
+        # Add HTTPS redirect block for redirect domains
+        local redir="$(get_fact redirect_domains 2>/dev/null)"
+        if [[ -n "$redir" ]]; then
+            cat >> "$TMPDIR/be-BOP.conf" << EOF
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name ${redir};
+    ssl_certificate     /etc/ssl/certs/ssl-cert-snakeoil.pem;
+    ssl_certificate_key /etc/ssl/private/ssl-cert-snakeoil.key;
+    return 307 https://${domain}\$request_uri;
+}
+EOF
+        fi
     fi
 
     install_file "$TMPDIR/be-BOP.conf" /etc/nginx/sites-available/be-BOP.conf
@@ -2031,9 +2100,15 @@ reload_nginx() {
 
 provision_ssl_cert() {
     log_info "Provisioning SSL certificate with Let's Encrypt..."
-    local domain="$(get_fact "specified_domain")"
     local email="$(get_fact "specified_email")"
-    run_privileged certbot --nginx -d "${domain}" -d "s3.${domain}" --non-interactive --agree-tos --email "${email}"
+    local main_domain="$(get_fact bebop_domain)"
+    local domains="$(domains_for_nginx)"
+
+    local certbot_args=(--nginx --cert-name "${main_domain}" --reinstall --non-interactive --agree-tos --email "${email}")
+    for d in $domains; do
+        certbot_args+=(-d "$d")
+    done
+    run_privileged certbot "${certbot_args[@]}"
 }
 
 install_phoenixd() {
@@ -2186,17 +2261,15 @@ write_bebop_configuration() {
     # shellcheck disable=SC2064  # TMPDIR should be expanded here (and not on trap).
     trap "rm -rf $TMPDIR" RETURN 2>/dev/null || true
 
-    # Generate be-BOP configuration
-    # Make sure to update the template_rev in bebop_config_wizard_fingerprint
-    # when updating this snippet:
+    # Make sure to update the template_rev in wizard_file_fingerprint bebop_config
     cat > "$TMPDIR/config.env" << EOF
 # This configuration is managed by be-bop-wizard
-# wizard-fingerprint: $(bebop_config_wizard_fingerprint)
+# wizard-fingerprint: $(wizard_file_fingerprint bebop_config)
 ADDRESS_HEADER=X-Forwarded-For
 MONGODB_DB=bebop
 MONGODB_URL=mongodb://127.0.0.1:27017
 ORIGIN=https://${domain}
-PUBLIC_S3_ENDPOINT_URL=https://s3.${domain}
+PUBLIC_S3_ENDPOINT_URL=https://$(get_fact s3_domain)
 PHOENIXD_ENDPOINT_URL=http://127.0.0.1:9740
 PHOENIXD_HTTP_PASSWORD=${phoenixd_http_password}
 S3_BUCKET=bebop
