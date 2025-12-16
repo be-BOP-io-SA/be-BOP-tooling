@@ -8,7 +8,7 @@
 
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.4.0"
+readonly SCRIPT_VERSION="2.4.1"
 readonly SCRIPT_NAME="be-bop-cli"
 readonly EXIT_SUCCESS=0
 readonly EXIT_ERROR=1
