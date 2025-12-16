@@ -3,7 +3,7 @@ name: Check Script Version Update
 on:
   pull_request:
     paths:
-      - "be-bop-wizard/be-bop-wizard.sh"
+      - "be-bop-bootstrap/be-bop-wizard.sh"
 
 jobs:
   check-wizard-version-updated:
@@ -22,7 +22,7 @@ jobs:
           set -eEuo pipefail
           versions=()
           check_failed=false
-          file="be-bop-wizard/be-bop-wizard.sh"
+          file="be-bop-bootstrap/be-bop-wizard.sh"
 
           echo "Checking SCRIPT_VERSION updates in commits that updated $file"
           for ref in $(git rev-list ${{ github.event.pull_request.base.ref }}..HEAD | tac); do
