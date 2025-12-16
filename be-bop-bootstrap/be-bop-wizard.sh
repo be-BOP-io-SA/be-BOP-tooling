@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.4.1"
+readonly SCRIPT_VERSION="2.4.2"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -819,6 +819,16 @@ inspect_system_state() {
         SYSTEM_STATE+=("phoenixd_running")
     fi
 
+    if [[ -f /usr/local/bin/be-bop-cli ]]; then
+        local cli_version_output
+        if cli_version_output=$(/usr/local/bin/be-bop-cli --version 2>/dev/null || true); then
+            local cli_version=$(echo "$cli_version_output" | awk '{print $2}' | sed 's/v//')
+            if [[ -n "$cli_version" ]]; then
+                SYSTEM_STATE+=("bebop_cli_version=${cli_version}")
+            fi
+        fi
+    fi
+
     if [[ -f /etc/minio/config.env ]]; then
         SYSTEM_STATE+=("minio_config_exists")
         if ! validate_minio_config_domain; then
@@ -1302,6 +1312,10 @@ plan_setup_tasks() {
         TASK_PLAN+=("start_and_enable_phoenixd")
     fi
 
+    if [[ "$(get_fact "bebop_cli_version" || true)" != "${SCRIPT_VERSION}" ]]; then
+        TASK_PLAN+=("install_bebop_cli")
+    fi
+
     if ! has_fact "bebop_service_exists"; then
         TASK_PLAN+=("install_bebop_service")
         if ! has_fact "running_in_container" && ! has_fact "bebop_overrides_exist"; then
@@ -1442,6 +1456,7 @@ list_tools_for_task() {
         "configure_mongodb_repo") echo "curl gpg" ;;
         "configure_nodejs_repo") echo "curl gpg" ;;
         "install_bebop_latest_release") echo "curl jq unzip" ;;
+        "install_bebop_cli") echo "stow" ;;
         "install_minio") echo "curl stow" ;;
         "install_phoenixd") echo "curl unzip stow" ;;
         "provision_ssl_cert") echo "certbot python3-certbot-nginx" ;;
@@ -1532,6 +1547,19 @@ summarize_state_and_plan() {
             echo "✓ running"
         elif has_fact "phoenixd_installed"; then
             echo "⚠ installed but not running"
+        else
+            echo "✗ missing"
+        fi
+    }
+
+    cli_state() {
+        local cli_version
+        if cli_version="$(get_fact "bebop_cli_version")"; then
+            if [[ "${cli_version}" == "${SCRIPT_VERSION}" ]]; then
+                echo "✓ installed (v${cli_version})"
+            else
+                echo "⚠ installed but version mismatch (v${cli_version} ≠ v${SCRIPT_VERSION})"
+            fi
         else
             echo "✗ missing"
         fi
@@ -1631,6 +1659,7 @@ summarize_state_and_plan() {
     echo "  • SSL certificate: $(ssl_state)"
     echo "  • phoenixd: $(phoenixd_state)"
     echo "  • MinIO: $(minio_state)"
+    echo "  • be-BOP CLI: $(cli_state)"
     echo "  • be-BOP: $(bebop_state)"
     echo "  • Security hardening: $(hardening_state)"
     echo ""
@@ -1752,6 +1781,7 @@ describe_task() {
         "configure_nodejs_repo") echo "Configure Node.js 22 repository" ;;
         "configure_phoenixd_hardening_overrides") echo "Apply security hardening to phoenixd service" ;;
         "initialize_mongodb_rs") echo "Initialize MongoDB replica set" ;;
+        "install_bebop_cli") echo "Install be-BOP maintenance tool (be-bop-cli)" ;;
         "install_bebop_latest_release") echo "Install latest be-BOP release" ;;
         "install_bebop_service") echo "Install be-BOP systemd service" ;;
         "install_minio") echo "Install MinIO object storage server" ;;
@@ -1794,6 +1824,7 @@ run_task() {
         "configure_nodejs_repo") configure_nodejs_repo ;;
         "configure_phoenixd_hardening_overrides") configure_phoenixd_hardening_overrides ;;
         "initialize_mongodb_rs") initialize_mongodb_rs ;;
+        "install_bebop_cli") install_bebop_cli ;;
         "install_bebop_latest_release") install_bebop_latest_release ;;
         "install_bebop_service") install_bebop_service ;;
         "install_minio") install_minio ;;
@@ -2238,6 +2269,60 @@ install_phoenixd() {
     run_privileged stow "phoenixd-${PHOENIXD_VERSION}"
     popd > /dev/null
     log_info "phoenixd ${PHOENIXD_VERSION} installed using stow"
+}
+
+install_bebop_cli() {
+    log_info "Installing be-BOP command-line interface..."
+
+    local STOW_DIR="/usr/local/be-bop"
+
+    # Remove any existing stow packages for CLI
+    if [[ -d "$STOW_DIR" ]]; then
+        pushd "$STOW_DIR" > /dev/null
+        local all_installations=($(find . -maxdepth 1 -type d -name "cli-*" | sort -V))
+        local total_installations=${#all_installations[@]}
+
+        # Cleanup old installations
+        local to_remove=$((total_installations > 5 ? total_installations - 5 : 0))
+        local installations_to_remove=("${all_installations[@]:0:$to_remove}")
+
+        # Check if the target package directory already exists and add it to removal list
+        if [[ -d "cli-${SCRIPT_VERSION}" ]]; then
+            installations_to_remove+=("cli-${SCRIPT_VERSION}")
+        fi
+
+        if [[ ${#installations_to_remove[@]} -gt 0 ]]; then
+            for old_installation in "${installations_to_remove[@]}"; do
+                log_info "Removing old CLI version: $old_installation"
+                run_privileged stow -D "$old_installation" 2>/dev/null || true
+                run_privileged rm -rf "$old_installation"
+            done
+        fi
+        popd > /dev/null
+    fi
+
+    local PACKAGE_DIR="$STOW_DIR/cli-${SCRIPT_VERSION}"
+    run_privileged mkdir -p "$PACKAGE_DIR/bin"
+
+    # Get the directory where this wizard script is located
+    local SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local CLI_SCRIPT="$SCRIPT_DIR/be-bop-cli.sh"
+
+    if [[ ! -f "$CLI_SCRIPT" ]]; then
+        die $EXIT_ERROR $LINENO "Could not find be-bop-cli.sh in the same directory as this wizard"
+    fi
+
+    # Copy CLI script to stow package directory
+    run_privileged cp "$CLI_SCRIPT" "$PACKAGE_DIR/bin/be-bop-cli"
+    run_privileged chmod +x "$PACKAGE_DIR/bin/be-bop-cli"
+    run_privileged chown root:root "$PACKAGE_DIR/bin/be-bop-cli"
+    run_privileged chmod u+s "$PACKAGE_DIR/bin/be-bop-cli"
+
+    # Use stow to symlink the binary
+    pushd "$STOW_DIR" > /dev/null
+    run_privileged stow "cli-${SCRIPT_VERSION}"
+    popd > /dev/null
+    log_info "be-BOP CLI v${SCRIPT_VERSION} installed using stow"
 }
 
 install_minio() {
