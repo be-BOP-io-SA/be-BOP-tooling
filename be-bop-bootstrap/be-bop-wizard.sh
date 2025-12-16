@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.4.0"
+readonly SCRIPT_VERSION="2.4.1"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -348,6 +348,7 @@ MORE OPTIONS:
     --help, -h              Show this help message
     --non-interactive       Do not prompt for confirmations (for automation)
     --verbose, -v           Enable detailed logging output
+    --version               Show version information
 
 EXAMPLES:
     # Interactive installation
@@ -358,6 +359,10 @@ EXAMPLES:
 
 For more information, visit: https://github.com/be-BOP-io-SA/be-BOP
 EOF
+}
+
+show_version() {
+    echo "$SCRIPT_NAME v$SCRIPT_VERSION"
 }
 
 parse_cli_arguments() {
@@ -405,6 +410,10 @@ parse_cli_arguments() {
             --verbose|-v)
                 VERBOSE=true
                 shift
+                ;;
+            --version)
+                show_version
+                exit $EXIT_SUCCESS
                 ;;
             *)
                 die $EXIT_ERROR $LINENO "Unknown option: $1. Use --help for usage information."
@@ -2886,8 +2895,8 @@ summarize_results() {
 # This top-level flow ties everything together into a readable, maintainable
 # automation pipeline that anyone can follow step by step.
 main() {
-    log_info "Starting $SCRIPT_NAME v$SCRIPT_VERSION (session: $SESSION_ID)"
     parse_cli_arguments "$@"
+    log_info "Starting $SCRIPT_NAME v$SCRIPT_VERSION (session: $SESSION_ID)"
     check_privileges
 
     # Detect environment and inspect system state

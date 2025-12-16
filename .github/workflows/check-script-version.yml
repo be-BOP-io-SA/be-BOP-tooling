@@ -4,10 +4,11 @@ on:
   pull_request:
     paths:
       - "be-bop-bootstrap/be-bop-wizard.sh"
+      - "be-bop-bootstrap/be-bop-cli.sh"
 
 jobs:
-  check-wizard-version-updated:
-    name: Check Wizard Version Updated
+  check-script-versions:
+    name: Check Script Versions Updated and Match
     runs-on: ubuntu-latest
     steps:
       - name: Checkout PR branch
@@ -17,35 +18,87 @@ jobs:
       - name: Fetch base branch
         run: |
           git fetch origin ${{ github.event.pull_request.base.ref }}:${{ github.event.pull_request.base.ref }}
-      - name: Check if SCRIPT_VERSION was updated in every commit
+      - name: Check if SCRIPT_VERSION was updated and versions match
         run: |
           set -eEuo pipefail
-          versions=()
+          wizard_versions=()
+          cli_versions=()
           check_failed=false
-          file="be-bop-bootstrap/be-bop-wizard.sh"
+          wizard_file="be-bop-bootstrap/be-bop-wizard.sh"
+          cli_file="be-bop-bootstrap/be-bop-cli.sh"
 
-          echo "Checking SCRIPT_VERSION updates in commits that updated $file"
+          # Check wizard script versions
+          echo "Checking SCRIPT_VERSION updates in commits that updated $wizard_file"
           for ref in $(git rev-list ${{ github.event.pull_request.base.ref }}..HEAD | tac); do
-            if [[ -n "$(git show "$ref" "$file")" ]]; then
-              version="$(git show "$ref" "$file" | grep -oP '^\+readonly SCRIPT_VERSION="\K[^"]+' || true)"
+            if [[ -n "$(git show "$ref" "$wizard_file" 2>/dev/null || true)" ]]; then
+              version="$(git show "$ref" "$wizard_file" | grep -oP '^\+readonly SCRIPT_VERSION="\K[^"]+' || true)"
               if [[ -n "$version" ]]; then
-                echo "$ref: ✅ SCRIPT_VERSION updated to version $version"
-                versions+=("$version")
+                echo "$ref: ✅ SCRIPT_VERSION updated to version $version in wizard script"
+                wizard_versions+=("$version")
               else
-                echo "$ref: ❌ SCRIPT_VERSION not updated"
+                echo "$ref: ❌ SCRIPT_VERSION not updated in wizard script"
                 check_failed=true
               fi
             fi
           done
           echo ""
 
-          # Check if versions are strictly increasing
-          sorted=$(printf '%s\n' "${versions[@]}" | sort -V)
-          unsorted=$(printf '%s\n' "${versions[@]}")
-          if [[ "$sorted" = "$unsorted" ]]; then
-            echo "✅ Versions are sorted in increasing order."
+          # Check CLI script versions
+          echo "Checking SCRIPT_VERSION updates in commits that updated $cli_file"
+          for ref in $(git rev-list ${{ github.event.pull_request.base.ref }}..HEAD | tac); do
+            if [[ -n "$(git show "$ref" "$cli_file" 2>/dev/null || true)" ]]; then
+              version="$(git show "$ref" "$cli_file" | grep -oP '^\+readonly SCRIPT_VERSION="\K[^"]+' || true)"
+              if [[ -n "$version" ]]; then
+                echo "$ref: ✅ SCRIPT_VERSION updated to version $version in CLI script"
+                cli_versions+=("$version")
+              else
+                echo "$ref: ❌ SCRIPT_VERSION not updated in CLI script"
+                check_failed=true
+              fi
+            fi
+          done
+          echo ""
+
+          # Check if wizard versions are strictly increasing
+          if [[ ${#wizard_versions[@]} -gt 0 ]]; then
+            sorted=$(printf '%s\n' "${wizard_versions[@]}" | sort -V)
+            unsorted=$(printf '%s\n' "${wizard_versions[@]}")
+            if [[ "$sorted" = "$unsorted" ]]; then
+              echo "✅ Wizard script versions are sorted in increasing order."
+            else
+              echo "❌ Wizard script versions are not sorted in increasing order."
+              check_failed=true
+            fi
+          fi
+
+          # Check if CLI versions are strictly increasing
+          if [[ ${#cli_versions[@]} -gt 0 ]]; then
+            sorted=$(printf '%s\n' "${cli_versions[@]}" | sort -V)
+            unsorted=$(printf '%s\n' "${cli_versions[@]}")
+            if [[ "$sorted" = "$unsorted" ]]; then
+              echo "✅ CLI script versions are sorted in increasing order."
+            else
+              echo "❌ CLI script versions are not sorted in increasing order."
+              check_failed=true
+            fi
+          fi
+
+          # Get current versions from both files
+          current_wizard_version=$(bash "$wizard_file" --version | awk '{print $2}' || true)
+          current_cli_version=$(bash "$cli_file" --version | awk '{print $2}' || true)
+
+          # Check if versions match
+          if [[ -n "$current_wizard_version" && -n "$current_cli_version" ]]; then
+            if [[ "$current_wizard_version" = "$current_cli_version" ]]; then
+              echo "✅ Both scripts have matching versions: $current_wizard_version"
+            else
+              echo "❌ Script versions do not match:"
+              echo "  Wizard script: $current_wizard_version"
+              echo "  CLI script: $current_cli_version"
+              check_failed=true
+            fi
           else
-            echo "❌ Versions are not sorted in increasing order."
+            echo "❌ Could not extract versions from one or both scripts"
             check_failed=true
           fi
           echo ""
@@ -53,15 +106,17 @@ jobs:
           if [[ "$check_failed" = true ]]; then
             echo ""
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-            echo "💡 Version check failed for $file"
+            echo "💡 Version check failed"
             echo ""
             echo "This usually means one of the following:"
-            echo "  • SCRIPT_VERSION was not updated in one or more commits that modified the script."
+            echo "  • SCRIPT_VERSION was not updated in one or more commits that modified a script."
             echo "  • SCRIPT_VERSION values are not strictly increasing (e.g. a version was reused or decreased)."
+            echo "  • The wizard and CLI scripts have different SCRIPT_VERSION values."
             echo ""
             echo "✅ To fix this:"
-            echo "  1. Make sure each commit updating ${file} also updates the SCRIPT_VERSION line."
+            echo "  1. Make sure each commit updating a script also updates the SCRIPT_VERSION line."
             echo "  2. Use monotonically increasing versions (e.g. 2025101601 → 2025101602)."
+            echo "  3. Ensure both $wizard_file and $cli_file have the same SCRIPT_VERSION."
             echo ""
             echo "After correcting the versions, push the updated commits to rerun this check."
             echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
