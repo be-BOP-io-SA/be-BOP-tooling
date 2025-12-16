@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.3.9"
+readonly SCRIPT_VERSION="2.3.10"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -1326,7 +1326,9 @@ plan_setup_tasks() {
     fi
 
     if [[ "${TASK_PLAN[*]}" =~ "start_and_enable_bebop" ]] || [[ "${TASK_PLAN[*]}" =~ "restart_bebop" ]]; then
-        TASK_PLAN+=("await_bebop_ready")
+        if has_fact "specified_domain"; then
+            TASK_PLAN+=("await_bebop_ready")
+        fi
     fi
 
     log_debug "Planned actions: ${TASK_PLAN[*]}"
