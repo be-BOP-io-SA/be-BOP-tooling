@@ -46,12 +46,9 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.3.7"
+readonly SCRIPT_VERSION="2.4.2"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
-
-# GitHub repository for be-BOP releases (can be overridden for development)
-readonly BEBOP_GITHUB_REPO="${BEBOP_GITHUB_REPO:-be-BOP-io-SA/be-BOP}"
 
 # Exit codes
 readonly EXIT_SUCCESS=0
@@ -263,6 +260,13 @@ run_privileged() {
     fi
 }
 
+run_bebop_cli() {
+    if [[ ! -f /usr/local/bin/be-bop-cli ]]; then
+        die $EXIT_ERROR $LINENO "be-bop-cli not found at /usr/local/bin/be-bop-cli"
+    fi
+    /usr/local/bin/be-bop-cli "$@"
+}
+
 # Wrapper for consistent file management
 install_file() {
     local source="$1"
@@ -322,6 +326,7 @@ MORE OPTIONS:
     --help, -h              Show this help message
     --non-interactive       Do not prompt for confirmations (for automation)
     --verbose, -v           Enable detailed logging output
+    --version               Show version information
 
 EXAMPLES:
     # Interactive installation
@@ -332,6 +337,10 @@ EXAMPLES:
 
 For more information, visit: https://github.com/be-BOP-io-SA/be-BOP
 EOF
+}
+
+show_version() {
+    echo "$SCRIPT_NAME v$SCRIPT_VERSION"
 }
 
 parse_cli_arguments() {
@@ -379,6 +388,10 @@ parse_cli_arguments() {
             --verbose|-v)
                 VERBOSE=true
                 shift
+                ;;
+            --version)
+                show_version
+                exit $EXIT_SUCCESS
                 ;;
             *)
                 die $EXIT_ERROR $LINENO "Unknown option: $1. Use --help for usage information."
@@ -589,6 +602,7 @@ inspect_system_state() {
     # Check what tools are available
     local potential_commands=(
         "apt"
+        "be-bop-cli"
         "curl"
         "gpg"
         "install"
@@ -745,13 +759,8 @@ inspect_system_state() {
         SYSTEM_STATE+=("bebop_running")
     fi
 
-    if [[ -L /var/lib/be-BOP/releases/current ]]; then
-        installed_release="$(basename "$(readlink -f /var/lib/be-BOP/releases/current)")"
-        if [[ "$installed_release" = "${LATEST_RELEASE_ASSET_BASENAME:-}" ]]; then
-            if [[ -f "/var/lib/be-BOP/releases/$installed_release/.bebop_install_success" ]]; then
-                SYSTEM_STATE+=("bebop_latest_release_installed")
-            fi
-        fi
+    if has_tool be-bop-cli && run_bebop_cli status --fail-if-latest-release-not-installed >/dev/null 2>&1; then
+        SYSTEM_STATE+=("bebop_latest_release_installed")
     fi
 
     if [[ -f /usr/local/bin/phoenixd ]]; then
@@ -764,6 +773,16 @@ inspect_system_state() {
 
     if has_tool systemctl && systemctl is-active --quiet phoenixd 2>/dev/null; then
         SYSTEM_STATE+=("phoenixd_running")
+    fi
+
+    if [[ -f /usr/local/bin/be-bop-cli ]]; then
+        local cli_version_output
+        if cli_version_output=$(/usr/local/bin/be-bop-cli --version 2>/dev/null || true); then
+            local cli_version=$(echo "$cli_version_output" | awk '{print $2}' | sed 's/v//')
+            if [[ -n "$cli_version" ]]; then
+                SYSTEM_STATE+=("bebop_cli_version=${cli_version}")
+            fi
+        fi
     fi
 
     if [[ -f /etc/minio/config.env ]]; then
@@ -940,44 +959,6 @@ get_fact() {
         fi
     done
     return 1
-}
-
-# This function retrieves the latest be-BOP release metadata
-# This function should export the following variables:
-#   - LATEST_RELEASE_META: The latest be-BOP release metadata
-#   - LATEST_RELEASE_ASSET_BASENAME: The basename of the latest be-BOP release asset
-#
-# If we're unable to retrieve the release information, LATEST_RELEASE_META
-# will be empty and LATEST_RELEASE_ASSET_BASENAME unset. This can happen if
-# `jq` is not installed or we're unable to obtain the data from GitHub.
-determine_latest_release_meta() {
-    # has_tool cannot be used here as the tools may have been installed since
-    # the available tools were discovered.
-    if ! command -v jq &>/dev/null || ! command -v curl &>/dev/null; then
-        log_debug "Could not fetch latest be-BOP release metadata since jq or curl is not installed"
-        export LATEST_RELEASE_META=""
-        return 0
-    fi
-    log_info "📡 Fetching latest be-BOP release metadata..."
-    local curl_args=(
-        "--connect-timeout" "$CURL_CONNECT_TIMEOUT"
-        "--fail"
-        "--location"
-        "--max-time" "$CURL_DOWNLOAD_TIMEOUT"
-        "--silent"
-    )
-    local url="https://api.github.com/repos/${BEBOP_GITHUB_REPO}/releases/latest"
-    export LATEST_RELEASE_META="$(curl "${curl_args[@]}" "$url" 2>/dev/null || true)"
-    log_debug "Latest release metadata: $(echo "$LATEST_RELEASE_META" | jq -c .)"
-    local filter='
-        .assets[]
-        | select(.name | test("be-BOP\\.release\\.[0-9]{4}-[0-9]{2}-[0-9]{2}\\.[a-f0-9]+.*\\.zip"))
-        | .name
-        | sub("\\.zip$"; "")
-    '
-    if [[ -n "$LATEST_RELEASE_META" ]]; then
-        export LATEST_RELEASE_ASSET_BASENAME=$(echo "$LATEST_RELEASE_META" | jq -r "$filter" | head -n 1)
-    fi
 }
 
 die_unsupported_os_distribution_for_tasks() {
@@ -1249,6 +1230,10 @@ plan_setup_tasks() {
         TASK_PLAN+=("start_and_enable_phoenixd")
     fi
 
+    if [[ "$(get_fact "bebop_cli_version" || true)" != "${SCRIPT_VERSION}" ]]; then
+        TASK_PLAN+=("install_bebop_cli")
+    fi
+
     if ! has_fact "bebop_service_exists"; then
         TASK_PLAN+=("install_bebop_service")
         if ! has_fact "running_in_container" && ! has_fact "bebop_overrides_exist"; then
@@ -1282,7 +1267,9 @@ plan_setup_tasks() {
     fi
 
     if [[ "${TASK_PLAN[*]}" =~ "start_and_enable_bebop" ]] || [[ "${TASK_PLAN[*]}" =~ "restart_bebop" ]]; then
-        TASK_PLAN+=("await_bebop_ready")
+        if has_fact "specified_domain"; then
+            TASK_PLAN+=("await_bebop_ready")
+        fi
     fi
 
     log_debug "Planned actions: ${TASK_PLAN[*]}"
@@ -1385,7 +1372,7 @@ list_tools_for_task() {
         "configure_bebop_site") echo "curl nginx ssl-cert" ;;
         "configure_mongodb_repo") echo "curl gpg" ;;
         "configure_nodejs_repo") echo "curl gpg" ;;
-        "install_bebop_latest_release") echo "curl jq unzip" ;;
+        "install_bebop_cli") echo "stow" ;;
         "install_minio") echo "curl stow" ;;
         "install_phoenixd") echo "curl unzip stow" ;;
         "provision_ssl_cert") echo "certbot python3-certbot-nginx" ;;
@@ -1481,6 +1468,19 @@ summarize_state_and_plan() {
         fi
     }
 
+    cli_state() {
+        local cli_version
+        if cli_version="$(get_fact "bebop_cli_version")"; then
+            if [[ "${cli_version}" == "${SCRIPT_VERSION}" ]]; then
+                echo "✓ installed (v${cli_version})"
+            else
+                echo "⚠ installed but version mismatch (v${cli_version} ≠ v${SCRIPT_VERSION})"
+            fi
+        else
+            echo "✗ missing"
+        fi
+    }
+
     minio_state() {
         if has_fact "minio_config_domain_mismatch"; then
             echo "⚠ configured for different domain (needs reconfiguration)"
@@ -1504,8 +1504,8 @@ summarize_state_and_plan() {
         elif has_fact "bebop_running"; then
             if has_fact "bebop_latest_release_installed"; then
                 echo "✓ up-to-date and running"
-            elif [[ -z $LATEST_RELEASE_META ]]; then
-                echo "⚠ failed to fetch latest release information"
+            elif ! has_tool be-bop-cli; then
+                echo "⚠ a newer release may be available (be-bop-cli required)"
             else
                 echo "⚠ a new release is available"
             fi
@@ -1575,6 +1575,7 @@ summarize_state_and_plan() {
     echo "  • SSL certificate: $(ssl_state)"
     echo "  • phoenixd: $(phoenixd_state)"
     echo "  • MinIO: $(minio_state)"
+    echo "  • be-BOP CLI: $(cli_state)"
     echo "  • be-BOP: $(bebop_state)"
     echo "  • Security hardening: $(hardening_state)"
     echo ""
@@ -1696,6 +1697,7 @@ describe_task() {
         "configure_nodejs_repo") echo "Configure Node.js 22 repository" ;;
         "configure_phoenixd_hardening_overrides") echo "Apply security hardening to phoenixd service" ;;
         "initialize_mongodb_rs") echo "Initialize MongoDB replica set" ;;
+        "install_bebop_cli") echo "Install be-BOP maintenance tool (be-bop-cli)" ;;
         "install_bebop_latest_release") echo "Install latest be-BOP release" ;;
         "install_bebop_service") echo "Install be-BOP systemd service" ;;
         "install_minio") echo "Install MinIO object storage server" ;;
@@ -1738,6 +1740,7 @@ run_task() {
         "configure_nodejs_repo") configure_nodejs_repo ;;
         "configure_phoenixd_hardening_overrides") configure_phoenixd_hardening_overrides ;;
         "initialize_mongodb_rs") initialize_mongodb_rs ;;
+        "install_bebop_cli") install_bebop_cli ;;
         "install_bebop_latest_release") install_bebop_latest_release ;;
         "install_bebop_service") install_bebop_service ;;
         "install_minio") install_minio ;;
@@ -2104,11 +2107,23 @@ provision_ssl_cert() {
     local main_domain="$(get_fact bebop_domain)"
     local domains="$(domains_for_nginx)"
 
-    local certbot_args=(--nginx --cert-name "${main_domain}" --reinstall --non-interactive --agree-tos --email "${email}")
+    local certbot_args=(
+        "--agree-tos"
+        "--cert-name" "${main_domain}"
+        "--email" "${email}"
+        "--nginx"
+        "--non-interactive"
+        "--reinstall"
+    )
     for d in $domains; do
         certbot_args+=(-d "$d")
     done
     run_privileged certbot "${certbot_args[@]}"
+
+    if has_tool ucf; then
+        # Certbot updates the nginx configuration, let ucf know about it.
+        run_privileged ucf /etc/nginx/sites-available/be-BOP.conf /etc/nginx/sites-available/be-BOP.conf
+    fi
 }
 
 install_phoenixd() {
@@ -2158,6 +2173,60 @@ install_phoenixd() {
     run_privileged stow "phoenixd-${PHOENIXD_VERSION}"
     popd > /dev/null
     log_info "phoenixd ${PHOENIXD_VERSION} installed using stow"
+}
+
+install_bebop_cli() {
+    log_info "Installing be-BOP command-line interface..."
+
+    local STOW_DIR="/usr/local/be-bop"
+
+    # Remove any existing stow packages for CLI
+    if [[ -d "$STOW_DIR" ]]; then
+        pushd "$STOW_DIR" > /dev/null
+        local all_installations=($(find . -maxdepth 1 -type d -name "cli-*" | sort -V))
+        local total_installations=${#all_installations[@]}
+
+        # Cleanup old installations
+        local to_remove=$((total_installations > 5 ? total_installations - 5 : 0))
+        local installations_to_remove=("${all_installations[@]:0:$to_remove}")
+
+        # Check if the target package directory already exists and add it to removal list
+        if [[ -d "cli-${SCRIPT_VERSION}" ]]; then
+            installations_to_remove+=("cli-${SCRIPT_VERSION}")
+        fi
+
+        if [[ ${#installations_to_remove[@]} -gt 0 ]]; then
+            for old_installation in "${installations_to_remove[@]}"; do
+                log_info "Removing old CLI version: $old_installation"
+                run_privileged stow -D "$old_installation" 2>/dev/null || true
+                run_privileged rm -rf "$old_installation"
+            done
+        fi
+        popd > /dev/null
+    fi
+
+    local PACKAGE_DIR="$STOW_DIR/cli-${SCRIPT_VERSION}"
+    run_privileged mkdir -p "$PACKAGE_DIR/bin"
+
+    # Get the directory where this wizard script is located
+    local SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local CLI_SCRIPT="$SCRIPT_DIR/be-bop-cli.sh"
+
+    if [[ ! -f "$CLI_SCRIPT" ]]; then
+        die $EXIT_ERROR $LINENO "Could not find be-bop-cli.sh in the same directory as this wizard"
+    fi
+
+    # Copy CLI script to stow package directory
+    run_privileged cp "$CLI_SCRIPT" "$PACKAGE_DIR/bin/be-bop-cli"
+    run_privileged chmod +x "$PACKAGE_DIR/bin/be-bop-cli"
+    run_privileged chown root:root "$PACKAGE_DIR/bin/be-bop-cli"
+    run_privileged chmod u+s "$PACKAGE_DIR/bin/be-bop-cli"
+
+    # Use stow to symlink the binary
+    pushd "$STOW_DIR" > /dev/null
+    run_privileged stow "cli-${SCRIPT_VERSION}"
+    popd > /dev/null
+    log_info "be-BOP CLI v${SCRIPT_VERSION} installed using stow"
 }
 
 install_minio() {
@@ -2649,94 +2718,7 @@ task_await_bebop_ready() {
 
 install_bebop_latest_release() {
     log_info "Installing latest be-BOP release..."
-
-    if [[ ! -n "$LATEST_RELEASE_META" ]] || [[ ! -n "${LATEST_RELEASE_ASSET_BASENAME:-}" ]]; then
-        # It is possible that jq was not available when we first tried to
-        # retrieve the release information. By the time we get here, it
-        # should be available, so we try one last time.
-        determine_latest_release_meta
-    fi
-
-    if [[ ! -n "$LATEST_RELEASE_META" ]] || [[ ! -n "${LATEST_RELEASE_ASSET_BASENAME:-}" ]]; then
-        local current=/var/lib/be-BOP/releases/current
-        if [[ -f "$current/.bebop_install_success" ]]; then
-            installed_date=$(date -r "$current/.bebop_install_success")
-            log_warn "
-┌──────────────────────────────────────────────────────────────────────────┐
-│ WARNING: I was unable to retrieve the latest be-BOP release information. │
-└──────────────────────────────────────────────────────────────────────────┘
-I found an existing installation of be-BOP installed on $installed_date.
-I will skip the current step, leave the existing installation intact, and continue.
-Please check your internet connection and try again at a later time."
-            return 0
-        else
-            die $EXIT_ERROR $LINENO "Unable to retrieve latest be-BOP release information"
-        fi
-    fi
-
-    local TARGET_DIR="/var/lib/be-BOP/releases/${LATEST_RELEASE_ASSET_BASENAME}"
-    if [[ -d "$TARGET_DIR" ]] && [[ -f "$TARGET_DIR/.bebop_install_success" ]]; then
-        log_info "Latest be-BOP release is already installed"
-    else
-        # Create temporary directory for download
-        local TMPDIR=$(mktemp -d)
-        # shellcheck disable=SC2064  # TMPDIR should be expanded here (and not on trap).
-        trap "rm -rf $TMPDIR" RETURN 2>/dev/null || true
-        pushd "$TMPDIR" > /dev/null
-
-        local filter='.assets[] | select(.name == "'"$LATEST_RELEASE_ASSET_BASENAME"'.zip") | .browser_download_url'
-        local LATEST_RELEASE_URL=$(echo "$LATEST_RELEASE_META" | jq -r "$filter")
-
-        if [[ -z "$LATEST_RELEASE_URL" || "$LATEST_RELEASE_URL" = "null" ]]; then
-            die $EXIT_ERROR $LINENO "Could not find latest be-BOP release URL"
-        fi
-
-        log_info "Downloading ${LATEST_RELEASE_ASSET_BASENAME} from ${LATEST_RELEASE_URL}"
-        local curl_args=(
-            "--connect-timeout" "$CURL_CONNECT_TIMEOUT"
-            "--fail"
-            "--location"
-            "--max-time" "$CURL_DOWNLOAD_TIMEOUT"
-            "--progress-bar"
-            "--show-error"
-            "--output" "be-BOP-latest.zip"
-        )
-        curl "${curl_args[@]}" "$LATEST_RELEASE_URL"
-        unzip -q be-BOP-latest.zip
-
-        local EXTRACTED_DIR=$(find . -maxdepth 1 -type d -name "be-BOP release *" | head -1)
-        if [[ -z "$EXTRACTED_DIR" ]]; then
-            die $EXIT_ERROR $LINENO "Could not find extracted directory for be-BOP release"
-        fi
-
-        if [[ -d "$TARGET_DIR" ]]; then
-            run_privileged rm -rf "$TARGET_DIR"
-        fi
-        run_privileged mkdir -p "$(dirname "$TARGET_DIR")"
-        run_privileged mv "$EXTRACTED_DIR" "$TARGET_DIR"
-
-        # Install dependencies
-        log_info "Installing be-BOP ${LATEST_RELEASE_ASSET_BASENAME} dependencies..."
-        pushd "$TARGET_DIR" > /dev/null
-        run_privileged corepack enable
-        run_privileged corepack install
-        run_privileged pnpm install --prod --frozen-lockfile
-        run_privileged touch .bebop_install_success
-        popd > /dev/null
-
-        popd > /dev/null
-        rm -rf "$TMPDIR"
-
-        log_info "Latest be-BOP release installed successfully at ${TARGET_DIR}!"
-    fi
-
-    # Create current symlink
-    if [[ -L /var/lib/be-BOP/releases/current ]]; then
-        run_privileged rm -f /var/lib/be-BOP/releases/current
-    elif [[ -e /var/lib/be-BOP/releases/current ]]; then
-        die $EXIT_ERROR $LINENO "Something unknown is blocking the creation of /var/lib/be-BOP/releases/current symlink. Please check what exists at this path and remove it manually."
-    fi
-    run_privileged ln -sf "$TARGET_DIR" /var/lib/be-BOP/releases/current
+    run_bebop_cli release install --no-restart-after-install
 }
 
 show_phoenixd_information() {
@@ -2803,12 +2785,11 @@ summarize_results() {
 # This top-level flow ties everything together into a readable, maintainable
 # automation pipeline that anyone can follow step by step.
 main() {
-    log_info "Starting $SCRIPT_NAME v$SCRIPT_VERSION (session: $SESSION_ID)"
     parse_cli_arguments "$@"
+    log_info "Starting $SCRIPT_NAME v$SCRIPT_VERSION (session: $SESSION_ID)"
     check_privileges
 
     # Detect environment and inspect system state
-    determine_latest_release_meta
     inspect_system_state
     plan_setup_tasks
     collect_all_required_tools
