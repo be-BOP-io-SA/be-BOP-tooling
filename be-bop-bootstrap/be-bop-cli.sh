@@ -8,7 +8,7 @@
 
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.5.0"
+readonly SCRIPT_VERSION="2.5.1"
 readonly SCRIPT_NAME="be-bop-cli"
 readonly EXIT_SUCCESS=0
 readonly EXIT_ERROR=1
@@ -75,8 +75,8 @@ check_if_running_as_be_bop_cli_user() {
 
 check_user() {
     case "$COMMAND" in
-        help|version)
-            # Allow any user to run these commands
+        version)
+            # Allow running as any user
             ;;
         *)
             check_if_running_as_be_bop_cli_user
