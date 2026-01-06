@@ -8,7 +8,7 @@
 
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.4.2"
+readonly SCRIPT_VERSION="2.5.0"
 readonly SCRIPT_NAME="be-bop-cli"
 readonly EXIT_SUCCESS=0
 readonly EXIT_ERROR=1
@@ -59,6 +59,31 @@ parse_cli_arguments() {
     done
 }
 
+check_if_running_as_be_bop_cli_user() {
+    local current_user=$(whoami 2>/dev/null || id -un 2>/dev/null || echo "unknown")
+
+    if [[ "$current_user" != "be-bop-cli" ]]; then
+        echo "ERROR: This script must be run as the 'be-bop-cli' user." >&2
+        echo "" >&2
+        echo "Current user: $current_user" >&2
+        echo "Required user: be-bop-cli" >&2
+        echo "" >&2
+        echo "If the be-bop-cli user doesn't exist, please run the be-bop-wizard to set up the system properly." >&2
+        exit $EXIT_ERROR
+    fi
+}
+
+check_user() {
+    case "$COMMAND" in
+        help|version)
+            # Allow any user to run these commands
+            ;;
+        *)
+            check_if_running_as_be_bop_cli_user
+            ;;
+    esac
+}
+
 execute_command() {
     case "$COMMAND" in
         help)
@@ -76,6 +101,7 @@ execute_command() {
 
 main() {
     parse_cli_arguments "$@"
+    check_user
     execute_command
 }
 
