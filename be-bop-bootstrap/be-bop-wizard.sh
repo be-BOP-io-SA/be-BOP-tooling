@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.5.0"
+readonly SCRIPT_VERSION="2.5.1"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -570,6 +570,7 @@ wizard_file_fingerprint() {
     case "${1:-bebop_config}" in
         bebop_config) template_rev="2025101602" ;;
         nginx_config) template_rev="2025112601" ;;
+        bebop_cli_wrapper) template_rev="2026010601" ;;
     esac
     if command -v sha256sum >/dev/null 2>&1; then
         printf 'sha256:%s\n' "$(printf '%s' "$template_rev" | sha256sum | awk '{print $1}')"
@@ -643,12 +644,15 @@ inspect_system_state() {
     local potential_commands=(
         "apt"
         "curl"
+        "gcc"
         "gpg"
         "install"
         "jq"
         "mongosh"
         "openssl"
+        "sha256sum"
         "stow"
+        "tcc"
         "ucf"
         "unzip"
     )
@@ -660,6 +664,7 @@ inspect_system_state() {
     done
     local potential_packages=(
         "certbot"
+        "libc6-dev"
         "mongodb-org"
         "nginx"
         "python3-certbot-nginx"
@@ -820,6 +825,15 @@ inspect_system_state() {
     fi
 
     if [[ -f /usr/local/bin/be-bop-cli ]]; then
+        # Extract wrapper fingerprint from binary
+        local wrapper_fingerprint
+        if wrapper_fingerprint=$(grep -ao "be-bop-cli-wrapper-fingerprint:[^[:space:]]*" /usr/local/bin/be-bop-cli 2>/dev/null | head -1 | cut -d: -f2- || true); then
+            if [[ -n "$wrapper_fingerprint" ]]; then
+                SYSTEM_STATE+=("bebop_cli_wrapper_fingerprint=${wrapper_fingerprint}")
+            fi
+        fi
+
+        # Extract CLI version
         local cli_version_output
         if cli_version_output=$(/usr/local/bin/be-bop-cli --version 2>/dev/null || true); then
             local cli_version=$(echo "$cli_version_output" | awk '{print $2}' | sed 's/v//')
@@ -1340,7 +1354,13 @@ plan_setup_tasks() {
         TASK_PLAN+=("start_and_enable_phoenixd")
     fi
 
-    if [[ "$(get_fact "bebop_cli_version" || true)" != "${SCRIPT_VERSION}" ]]; then
+    # Update CLI if wrapper fingerprint doesn't match OR version is wrong/missing
+    # Since wrapper has script hash baked in, both components must be updated together
+    local current_cli_version="$(get_fact "bebop_cli_version" || true)"
+    if [[ "$(get_fact "bebop_cli_wrapper_fingerprint" || true)" != \
+          "$(wizard_file_fingerprint "bebop_cli_wrapper")" ]] || \
+       [[ -z "$current_cli_version" ]] || \
+       [[ "$current_cli_version" != "${SCRIPT_VERSION}" ]]; then
         TASK_PLAN+=("install_bebop_cli")
     fi
 
@@ -1484,7 +1504,7 @@ list_tools_for_task() {
         "configure_mongodb_repo") echo "curl gpg" ;;
         "configure_nodejs_repo") echo "curl gpg" ;;
         "install_bebop_latest_release") echo "curl jq unzip" ;;
-        "install_bebop_cli") echo "stow" ;;
+        "install_bebop_cli") echo "sha256sum tcc" ;;
         "install_minio") echo "curl stow" ;;
         "install_phoenixd") echo "curl unzip stow" ;;
         "provision_ssl_cert") echo "certbot python3-certbot-nginx" ;;
@@ -1521,6 +1541,14 @@ collect_all_required_tools() {
                     ;;
                 "mongosh")
                     INSTALL_TOOLS+=("mongodb-mongosh")
+                    ;;
+                "tcc"|"gcc"|"cc")
+                    if ! has_tool gcc && ! has_tool tcc; then
+                        INSTALL_TOOLS+=("tcc" "libc6-dev")
+                    fi
+                    ;;
+                "sha256sum")
+                    INSTALL_TOOLS+=("coreutils")
                     ;;
                 *)
                     INSTALL_TOOLS+=("$tool")
@@ -1581,15 +1609,20 @@ summarize_state_and_plan() {
     }
 
     cli_state() {
-        local cli_version
-        if cli_version="$(get_fact "bebop_cli_version")"; then
-            if [[ "${cli_version}" == "${SCRIPT_VERSION}" ]]; then
-                echo "✓ installed (v${cli_version})"
-            else
-                echo "⚠ installed but version mismatch (v${cli_version} ≠ v${SCRIPT_VERSION})"
-            fi
-        else
+        local cli_version="$(get_fact "bebop_cli_version" || true)"
+        local wrapper_fingerprint="$(get_fact "bebop_cli_wrapper_fingerprint" || true)"
+        local expected_wrapper_fingerprint="$(wizard_file_fingerprint "bebop_cli_wrapper")"
+
+        if [[ -z "$cli_version" ]]; then
             echo "✗ missing"
+        elif [[ -z "$wrapper_fingerprint" ]]; then
+            echo "⚠ installed but wrapper fingerprint missing"
+        elif [[ "$wrapper_fingerprint" != "$expected_wrapper_fingerprint" ]]; then
+            echo "⚠ installed but wrapper fingerprint mismatch"
+        elif [[ "$cli_version" != "$SCRIPT_VERSION" ]]; then
+            echo "⚠ installed but version mismatch (v${cli_version} ≠ v${SCRIPT_VERSION})"
+        else
+            echo "✓ installed (v${cli_version})"
         fi
     }
 
@@ -2304,57 +2337,75 @@ install_phoenixd() {
 }
 
 install_bebop_cli() {
-    log_info "Installing be-BOP command-line interface..."
+    log_info "Installing be-BOP CLI with SUID wrapper..."
 
-    local STOW_DIR="/usr/local/be-bop"
-
-    # Remove any existing stow packages for CLI
-    if [[ -d "$STOW_DIR" ]]; then
-        pushd "$STOW_DIR" > /dev/null
-        local all_installations=($(find . -maxdepth 1 -type d -name "cli-*" | sort -V))
-        local total_installations=${#all_installations[@]}
-
-        # Cleanup old installations
-        local to_remove=$((total_installations > 5 ? total_installations - 5 : 0))
-        local installations_to_remove=("${all_installations[@]:0:$to_remove}")
-
-        # Check if the target package directory already exists and add it to removal list
-        if [[ -d "cli-${SCRIPT_VERSION}" ]]; then
-            installations_to_remove+=("cli-${SCRIPT_VERSION}")
-        fi
-
-        if [[ ${#installations_to_remove[@]} -gt 0 ]]; then
-            for old_installation in "${installations_to_remove[@]}"; do
-                log_info "Removing old CLI version: $old_installation"
-                run_privileged stow -D "$old_installation" 2>/dev/null || true
-                run_privileged rm -rf "$old_installation"
-            done
-        fi
-        popd > /dev/null
+    # Determine which compiler to use
+    local CC=""
+    if command -v tcc &>/dev/null; then
+        CC="tcc"
+    elif command -v gcc &>/dev/null; then
+        CC="gcc"
+    elif command -v cc &>/dev/null; then
+        CC="cc"
+    else
+        die $EXIT_ERROR $LINENO "No C compiler available (tried tcc, gcc, cc)."
     fi
-
-    local PACKAGE_DIR="$STOW_DIR/cli-${SCRIPT_VERSION}"
-    run_privileged mkdir -p "$PACKAGE_DIR/bin"
+    log_info "Using C compiler: $CC"
 
     # Get the directory where this wizard script is located
     local SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     local CLI_SCRIPT="$SCRIPT_DIR/be-bop-cli.sh"
+    local WRAPPER_TEMPLATE="$SCRIPT_DIR/be-bop-cli-wrapper.c"
 
     if [[ ! -f "$CLI_SCRIPT" ]]; then
         die $EXIT_ERROR $LINENO "Could not find be-bop-cli.sh in the same directory as this wizard"
     fi
 
-    # Copy CLI script to stow package directory
-    run_privileged cp "$CLI_SCRIPT" "$PACKAGE_DIR/bin/be-bop-cli"
-    run_privileged chmod +x "$PACKAGE_DIR/bin/be-bop-cli"
-    run_privileged chown root:root "$PACKAGE_DIR/bin/be-bop-cli"
-    run_privileged chmod u+s "$PACKAGE_DIR/bin/be-bop-cli"
+    if [[ ! -f "$WRAPPER_TEMPLATE" ]]; then
+        die $EXIT_ERROR $LINENO "Could not find be-bop-cli-wrapper.c in the same directory as this wizard"
+    fi
 
-    # Use stow to symlink the binary
-    pushd "$STOW_DIR" > /dev/null
-    run_privileged stow "cli-${SCRIPT_VERSION}"
-    popd > /dev/null
-    log_info "be-BOP CLI v${SCRIPT_VERSION} installed using stow"
+    # Create directories
+    run_privileged mkdir -p /usr/local/libexec
+    run_privileged mkdir -p /usr/local/bin
+
+    # Install the real script
+    run_privileged cp "$CLI_SCRIPT" /usr/local/libexec/be-bop-cli.real
+    run_privileged chmod 755 /usr/local/libexec/be-bop-cli.real
+    run_privileged chown be-bop-cli:be-bop-cli /usr/local/libexec/be-bop-cli.real
+
+    # Calculate script size and hash
+    local SCRIPT_SIZE=$(stat -c %s /usr/local/libexec/be-bop-cli.real)
+    local SCRIPT_HASH=""
+    if command -v sha256sum &>/dev/null; then
+        SCRIPT_HASH=$(sha256sum /usr/local/libexec/be-bop-cli.real | cut -d' ' -f1)
+    else
+        die $EXIT_ERROR $LINENO "sha256sum tool is required but not available"
+    fi
+    local WRAPPER_FINGERPRINT=$(wizard_file_fingerprint "bebop_cli_wrapper")
+
+    # Create temporary directory for compilation
+    local TMPDIR=$(mktemp -d)
+    # shellcheck disable=SC2064  # TMPDIR should be expanded here (and not on trap).
+    trap "rm -rf $TMPDIR" RETURN 2>/dev/null || true
+
+    # Compile the wrapper with embedded values via -D flags
+    log_info "Compiling SUID wrapper with hash: $SCRIPT_HASH"
+    if ! $CC \
+        -DSCRIPT_EXPECTED_SHA256_HEX="\"$SCRIPT_HASH\"" \
+        -DSCRIPT_SIZE_BYTES="$SCRIPT_SIZE" \
+        -DWRAPPER_FINGERPRINT="\"$WRAPPER_FINGERPRINT\"" \
+        -o "$TMPDIR/be-bop-cli" \
+        "$WRAPPER_TEMPLATE"; then
+        die $EXIT_ERROR $LINENO "Failed to compile be-bop-cli wrapper"
+    fi
+
+    # Install the compiled wrapper
+    run_privileged cp "$TMPDIR/be-bop-cli" /usr/local/bin/be-bop-cli
+    run_privileged chown be-bop-cli:be-bop-cli /usr/local/bin/be-bop-cli
+    run_privileged chmod 6755 /usr/local/bin/be-bop-cli
+
+    log_info "be-BOP CLI v${SCRIPT_VERSION} installed with SUID wrapper"
 }
 
 install_minio() {
