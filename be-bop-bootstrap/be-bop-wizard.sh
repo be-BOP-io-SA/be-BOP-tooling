@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.4.2"
+readonly SCRIPT_VERSION="2.5.0"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -865,6 +865,24 @@ inspect_system_state() {
         SYSTEM_STATE+=("bebop_overrides_exist")
     fi
 
+    # Check be-bop-cli user configuration
+    if getent passwd be-bop-cli >/dev/null 2>&1; then
+        SYSTEM_STATE+=("bebop_cli_user_exists")
+
+        # Check if home directory is correct
+        local user_home=$(getent passwd be-bop-cli | cut -d: -f6)
+        if [[ "$user_home" = "/var/lib/be-BOP" ]]; then
+            SYSTEM_STATE+=("bebop_cli_user_home_correct")
+        fi
+    fi
+
+    # Check be-BOP directory permissions
+    if has_fact "bebop_cli_user_exists" && [[ -d /var/lib/be-BOP ]]; then
+        if [[ -n "$(find /var/lib/be-BOP -not -user be-bop-cli -o -not -group be-bop-cli)" ]]; then
+            SYSTEM_STATE+=("bebop_directory_permissions_correct")
+        fi
+    fi
+
     log_debug "Available tools: ${AVAILABLE_TOOLS[*]}"
     log_debug "System state: ${SYSTEM_STATE[*]}"
     log_debug "System state check complete"
@@ -1218,6 +1236,16 @@ check_os_supported_by_wizard() {
 plan_setup_tasks() {
     log_debug "Planning what needs to be done..."
     export TASK_PLAN=()
+
+    # Configure be-bop-cli user (must come early in the plan)
+    if ! has_fact "bebop_cli_user_exists" || ! has_fact "bebop_cli_user_home_correct"; then
+        TASK_PLAN+=("configure_bebop_cli_user")
+    fi
+
+    # Set up be-BOP directory permissions (after user is configured)
+    if ! has_fact "bebop_directory_permissions_correct"; then
+        TASK_PLAN+=("setup_bebop_directory_permissions")
+    fi
 
     # Smart cascading logic for Node.js
     if ! has_fact "nodejs_available"; then
@@ -1774,6 +1802,7 @@ prepare_toolbox() {
 describe_task() {
     case "$1" in
         "await_bebop_ready") echo "Wait for be-BOP service to be ready" ;;
+        "configure_bebop_cli_user") echo "Configure be-BOP CLI system user" ;;
         "configure_bebop_hardening_overrides") echo "Apply security hardening to be-BOP service" ;;
         "configure_bebop_site") echo "Configure be-BOP nginx site" ;;
         "configure_minio_hardening_overrides") echo "Apply security hardening to MinIO service" ;;
@@ -1795,6 +1824,7 @@ describe_task() {
         "reload_nginx") echo "Reload nginx configuration" ;;
         "restart_bebop") echo "Restart be-BOP service" ;;
         "restart_minio") echo "Restart MinIO service" ;;
+        "setup_bebop_directory_permissions") echo "Set up be-BOP directory permissions" ;;
         "start_and_enable_bebop") echo "Start and enable be-BOP service" ;;
         "start_and_enable_minio") echo "Start and enable MinIO service" ;;
         "start_and_enable_mongodb") echo "Start and enable MongoDB service" ;;
@@ -1817,6 +1847,7 @@ describe_task() {
 run_task() {
     case "$1" in
         "await_bebop_ready") task_await_bebop_ready ;;
+        "configure_bebop_cli_user") configure_bebop_cli_user ;;
         "configure_bebop_hardening_overrides") configure_bebop_hardening_overrides ;;
         "configure_bebop_site") configure_bebop_site ;;
         "configure_minio_hardening_overrides") configure_minio_hardening_overrides ;;
@@ -1838,6 +1869,7 @@ run_task() {
         "reload_nginx") reload_nginx ;;
         "restart_bebop") restart_bebop ;;
         "restart_minio") restart_minio ;;
+        "setup_bebop_directory_permissions") setup_bebop_directory_permissions ;;
         "start_and_enable_bebop") start_and_enable_bebop ;;
         "start_and_enable_minio") start_and_enable_minio ;;
         "start_and_enable_mongodb") start_and_enable_mongodb ;;
@@ -2944,6 +2976,53 @@ show_phoenixd_information() {
     run_privileged grep -oP 'http-password=\K[^ ]+' "$PHOENIXD_DATA_DIR/phoenix.conf" 2>/dev/null \
       || echo "(http-password not found in $PHOENIXD_DATA_DIR/phoenix.conf)"
     echo ""
+}
+
+configure_bebop_cli_user() {
+    log_info "Configuring be-BOP CLI system user..."
+
+    if ! getent passwd be-bop-cli >/dev/null 2>&1; then
+        log_info "Creating be-bop-cli system user..."
+        run_privileged useradd --system --home-dir /var/lib/be-BOP \
+            --create-home --shell /bin/false \
+            --comment "be-BOP CLI system user" be-bop-cli
+    else
+        log_info "be-bop-cli user exists, checking configuration..."
+
+        # Check and fix home directory if needed
+        local current_home=$(getent passwd be-bop-cli | cut -d: -f6)
+        if [[ "$current_home" != "/var/lib/be-BOP" ]]; then
+            log_info "Fixing be-bop-cli user home directory (was: $current_home)..."
+            run_privileged usermod --home /var/lib/be-BOP be-bop-cli
+
+            # Create the home directory if it doesn't exist
+            if [[ ! -d /var/lib/be-BOP ]]; then
+                run_privileged mkdir -p /var/lib/be-BOP
+            fi
+        fi
+    fi
+}
+
+setup_bebop_directory_permissions() {
+    log_info "Setting up be-BOP directory permissions..."
+
+    # Ensure /var/lib/be-BOP exists
+    if [[ ! -d /var/lib/be-BOP ]]; then
+        run_privileged mkdir -p /var/lib/be-BOP
+    fi
+
+    # Set ownership to be-bop-cli user and group
+    run_privileged chown be-bop-cli:be-bop-cli /var/lib/be-BOP
+
+    # Set permissions: owner can read/write/execute, group and others can read/execute
+    run_privileged chmod 755 /var/lib/be-BOP
+
+    # Ensure subdirectories have correct ownership (recursively)
+    # This handles any existing subdirectories that might have wrong ownership
+    if [[ -n "$(find /var/lib/be-BOP -not -user be-bop-cli -o -not -group be-bop-cli)" ]]; then
+        log_info "Fixing ownership of existing subdirectories in /var/lib/be-BOP..."
+        run_privileged chown -R be-bop-cli:be-bop-cli /var/lib/be-BOP
+    fi
 }
 
 # ---[ 7. Summarize the outcome ]---
