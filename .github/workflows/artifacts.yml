@@ -20,20 +20,20 @@ jobs:
       - name: Build release artifact
         run: |
           just
-          # Extract artifact directory name for later steps
-          HASH=$(git rev-parse --short HEAD)
-          COMMIT_DATE="$(git log -1 --date=format:%F --pretty=format:%cd)"
-          ARTIFACT_PATH="dist/be-bop-wizard.sh"
-          echo "Artifact path: $ARTIFACT_PATH"
-          echo "ARTIFACT_PATH=$ARTIFACT_PATH" >> $GITHUB_ENV
-          echo "COMMIT_DATE=$COMMIT_DATE" >> $GITHUB_ENV
-          echo "HASH=$HASH" >> $GITHUB_ENV
-      - name: Upload artifact
+      - name: Upload artifact (PR)
+        if: github.ref != 'refs/heads/main'
+        uses: mmkal/artifact.ci/upload@main
+        with:
+          name: be-bop-wizard
+          path: dist/
+          artifactci-visibility: public
+          artifactci-mode: eager
+      - name: Upload artifact (main)
+        if: github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@v4
         with:
-          name: be-BOP wizard ${{ env.COMMIT_DATE }} (${{ env.HASH }})
-          path: ${{ env.ARTIFACT_PATH }}
-
+          name: be-bop-wizard
+          path: dist/
   release:
     name: Create GitHub Release
     needs: build

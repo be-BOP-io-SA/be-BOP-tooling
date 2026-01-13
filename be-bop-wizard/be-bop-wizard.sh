@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.3.7"
+readonly SCRIPT_VERSION="2.3.8"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -252,6 +252,32 @@ die_user_abort() {
     echo ""
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     exit "$EXIT_USER_ABORT"
+}
+
+die_unexpected_architecture() {
+    local arch=$1
+
+    log_error "Unsupported architecture: $arch"
+    log_error "The script paused to prevent any potential issues."
+    echo ""
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "🤖 I've never seen this architecture before!"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "✓ Your system has not been changed in any unsafe way"
+    echo ""
+    echo "Your system reports architecture: $arch"
+    echo ""
+    echo "We'd really like to hear about your setup — it helps us support more platforms!"
+    echo ""
+    echo "🪪 Please reach out to us:"
+    echo "    - Email: contact@be-bop.io"
+    echo "    - Nostr: npub16l9pnrkhhagkucjhxvvztz2czv9ex8s5u7yg80ghw9ccjp4j25pqaku4ha"
+    echo ""
+    echo "📡 Follow updates and tooling improvements at:"
+    echo "    → https://be-bop.io/release-note"
+    echo ""
+    echo "Thank you for helping us expand our horizons. 🤝"
+    exit "$EXIT_INCOMPATIBLE_SYSTEM_STATE"
 }
 
 # Sudo wrapper for consistent privilege handling
@@ -573,6 +599,24 @@ inspect_system_state() {
         [[ "$DOMAIN" != "$base" ]] && redir+=("$base")
         [[ ${#redir[@]} -gt 0 ]] && SYSTEM_STATE+=("redirect_domains=${redir[*]}")
     fi
+
+    # We piggy-back on Debian's architecture naming convention, but our use is
+    # unrelated to Debian. We use their naming convention because it's thought
+    # with the objective of maintaining package-sets. This is in contrast to
+    # kernel conventions where the objective is to describe the CPU architecture
+    # but the same binary may run on multiple architectures.
+    # See https://www.debian.org/ports
+    case "$(uname -m)" in
+        x86_64)
+            SYSTEM_STATE+=("debian_arch=amd64")
+            ;;
+        aarch64)
+            SYSTEM_STATE+=("debian_arch=arm64")
+            ;;
+        *)
+            die_unexpected_architecture "$(uname -m)"
+            ;;
+    esac
 
     detect_os_information
     SYSTEM_STATE+=("os_name=${DETECTED_MACHINE_OS_NAME}")
@@ -1322,8 +1366,9 @@ check_options_required_by_planned_tasks_but_missing() {
 }
 
 check_cpu_features_required_by_planned_tasks() {
-    # Check if MongoDB will be started and verify AVX support
-    if [[ "${TASK_PLAN[*]}" =~ "start_and_enable_mongodb" ]]; then
+    local machine="$(uname -m)"
+    # Check if MongoDB will be started on amd64 and verify AVX support
+    if [[ "$(get_fact "debian_arch")" = "amd64" ]] && [[ "${TASK_PLAN[*]}" =~ "start_and_enable_mongodb" ]]; then
         log_debug "MongoDB service start is planned, checking CPU AVX instruction set support..."
 
         if ! grep -q ' avx ' /proc/cpuinfo 2>/dev/null; then
@@ -2128,7 +2173,19 @@ install_phoenixd() {
         pushd "$TEMP_DIR" > /dev/null
 
         # Download and extract phoenixd
-        local phoenixd_url="https://github.com/ACINQ/phoenixd/releases/download/v${PHOENIXD_VERSION}/phoenixd-${PHOENIXD_VERSION}-linux-x64.zip"
+        local arch_string
+        case "$(get_fact "debian_arch")" in
+            amd64)
+                arch_string="x64"
+                ;;
+            arm64)
+                arch_string="arm64"
+                ;;
+            *)
+                die_unexpected_architecture "$(get_fact "debian_arch")"
+                ;;
+        esac
+        local phoenixd_url="https://github.com/ACINQ/phoenixd/releases/download/v${PHOENIXD_VERSION}/phoenixd-${PHOENIXD_VERSION}-linux-${arch_string}.zip"
         log_info "Downloading phoenixd ${PHOENIXD_VERSION} from ${phoenixd_url}"
         local curl_args=(
             "--connect-timeout" "$CURL_CONNECT_TIMEOUT"
@@ -2177,7 +2234,19 @@ install_minio() {
         pushd "$TEMP_DIR" > /dev/null
 
         # Download MinIO binary
-        local MINIO_URL="https://dl.min.io/server/minio/release/linux-amd64/archive/minio.${MINIO_VERSION}"
+        local arch_string
+        case "$(uname -m)" in
+          x86_64)
+            arch_string="amd64"
+            ;;
+          aarch64)
+            arch_string="arm64"
+            ;;
+          *)
+            die $EXIT_ERROR $LINENO "Could not find minio binary download URL for your architecture"
+            ;;
+        esac
+        local MINIO_URL="https://dl.min.io/server/minio/release/linux-$arch_string/archive/minio.${MINIO_VERSION}"
         log_info "Downloading MinIO ${MINIO_VERSION} from ${MINIO_URL}"
         local curl_args=(
             "--connect-timeout" "$CURL_CONNECT_TIMEOUT"
