@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.3.8"
+readonly SCRIPT_VERSION="2.3.10"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -1326,7 +1326,9 @@ plan_setup_tasks() {
     fi
 
     if [[ "${TASK_PLAN[*]}" =~ "start_and_enable_bebop" ]] || [[ "${TASK_PLAN[*]}" =~ "restart_bebop" ]]; then
-        TASK_PLAN+=("await_bebop_ready")
+        if has_fact "specified_domain"; then
+            TASK_PLAN+=("await_bebop_ready")
+        fi
     fi
 
     log_debug "Planned actions: ${TASK_PLAN[*]}"
@@ -2149,11 +2151,23 @@ provision_ssl_cert() {
     local main_domain="$(get_fact bebop_domain)"
     local domains="$(domains_for_nginx)"
 
-    local certbot_args=(--nginx --cert-name "${main_domain}" --reinstall --non-interactive --agree-tos --email "${email}")
+    local certbot_args=(
+        "--agree-tos"
+        "--cert-name" "${main_domain}"
+        "--email" "${email}"
+        "--nginx"
+        "--non-interactive"
+        "--reinstall"
+    )
     for d in $domains; do
         certbot_args+=(-d "$d")
     done
     run_privileged certbot "${certbot_args[@]}"
+
+    if has_tool ucf; then
+        # Certbot updates the nginx configuration, let ucf know about it.
+        run_privileged ucf /etc/nginx/sites-available/be-BOP.conf /etc/nginx/sites-available/be-BOP.conf
+    fi
 }
 
 install_phoenixd() {
