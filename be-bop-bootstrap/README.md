@@ -1,3 +1,44 @@
+# Bootstrap Bundle
+
+The files in this directory are bundled into a **self-extracting script** (we
+call this be-BOP bootstrap). When executed, that script unpacks this directory
+into a temporary location and then launches **be-bop-wizard**, which performs
+the actual installation and initial configuration of be-BOP. Because this is a
+drop-in replacement for the wizard, the resulting artifact is named
+`be-bop-wizard.sh`.
+
+This folder exists in two contexts:
+
+## If you are viewing this inside source control
+
+This directory defines the **exact payload** that will be embedded into the
+script. Everything placed here is shipped to users and will appear exactly as-is
+when the bootstrap script extracts itself.
+
+Typical contents include:
+
+- [be-bop-wizard.sh](#be-bop-wizard) — the interactive installer responsible for
+  deployment.
+- [be-bop-cli.sh](#be-bop-cli) — the CLI used during setup and by operators
+  after installation.
+- Optional assets (templates, defaults, helper scripts).
+
+Only purposeful, version-controlled files should live here. \
+Do **not** place temporary files, build outputs, or experiment artifacts.
+
+## If you found this directory in `/tmp` (or another temp location)
+
+You likely just ran the **be-BOP bootstrap** installer.
+
+This directory is the unpacked installation payload that the bootstrapper uses
+internally. It is safe to inspect, and normally it will be cleaned up
+automatically after the installation completes.
+
+It contains the scripts and tools that the installer used to configure your
+system. You can usually delete it unless debugging an installation issue.
+
+---
+
 # be-bop-wizard
 
 This is a self-guided installation and configuration tool for be-BOP.
@@ -180,3 +221,18 @@ sudo journalctl -u bebop -f
 sudo journalctl -u phoenixd -f
 sudo journalctl -u minio -f
 ```
+
+---
+
+# be-bop-cli
+
+Simple CLI tool to perform regular maintenance operations in a be-BOP
+installation.
+
+This tool in installed by be-bop-wizard.
+
+## Usage
+
+### 🚀 Quick Start
+
+See `be-bop-wizard.sh --help` for a list of available options.
