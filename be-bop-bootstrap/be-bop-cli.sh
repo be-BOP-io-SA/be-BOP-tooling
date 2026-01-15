@@ -8,7 +8,7 @@
 
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.5.2"
+readonly SCRIPT_VERSION="2.5.3"
 readonly SCRIPT_NAME="be-bop-cli"
 readonly EXIT_SUCCESS=0
 readonly EXIT_ERROR=1
@@ -77,6 +77,29 @@ die_missing_tool() {
     echo ""
     echo "After installing the tool, run the command again."
     echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    exit $EXIT_ERROR
+}
+
+die_unknown_release() {
+    local release="$1"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "⚠️ The specified release could not found: $release"
+    echo ""
+    echo "To see all available releases, run:"
+    echo "  be-bop-cli release list"
+    echo ""
+    echo "(The release ID is shown in the first column of the output.)"
+    echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo "If you need assistance, please share the full command output with us."
+    echo ""
+    echo "🪪 Contact options:"
+    echo "    - Email: contact@be-bop.io"
+    echo "    - Nostr: npub16l9pnrkhhagkucjhxvvztz2czv9ex8s5u7yg80ghw9ccjp4j25pqaku4ha"
+    echo ""
+    echo "📡 Follow updates and tooling improvements at:"
+    echo "    → https://be-bop.io/release-note"
+    echo ""
+    echo "Thank you for helping us make things better — and for being a friendly human. 🤝"
     exit $EXIT_ERROR
 }
 
@@ -214,8 +237,8 @@ check_if_running_as_be_bop_cli_user() {
 }
 
 check_user() {
-    case "$COMMAND" in
-        version)
+    case "$COMMAND,$SUBCOMMAND" in
+        help,*|version,*|release,list)
             # Allow running as any user
             ;;
         *)
@@ -224,57 +247,10 @@ check_user() {
     esac
 }
 
-# This function retrieves the latest be-BOP release metadata from GitHub
-# This function exports the following variables:
-#   - LATEST_RELEASE_META: The latest be-BOP release metadata (JSON)
-#   - LATEST_RELEASE_ASSET_BASENAME: The basename of the latest be-BOP release asset
-#   - LATEST_RELEASE_TAG: The tag name of the latest release (e.g., rel/2025-12-17/bfe5008)
-#
-# If we're unable to retrieve the release information, this function will die with an error.
-determine_latest_release_meta() {
-    log_debug "Fetching latest be-BOP release metadata from GitHub..."
-
-    local curl_args=(
-        "--connect-timeout" "$CURL_CONNECT_TIMEOUT"
-        "--fail"
-        "--location"
-        "--max-time" "$CURL_DOWNLOAD_TIMEOUT"
-        "--show-error"
-        "--silent"
-    )
-    local url="https://api.github.com/repos/${BEBOP_GITHUB_REPO}/releases/latest"
-
-    if ! LATEST_RELEASE_META="$(curl "${curl_args[@]}" "$url" 2>/dev/null)"; then
-        die $EXIT_ERROR $LINENO "Failed to fetch release information from GitHub. Please check your internet connection."
-    fi
-
-    if [[ -z "$LATEST_RELEASE_META" ]]; then
-        die $EXIT_ERROR $LINENO "Received empty response from GitHub API"
-    fi
-
-    local filter='
-        .assets[]
-        | select(.name | test("be-BOP\\.release\\.[0-9]{4}-[0-9]{2}-[0-9]{2}\\.[a-f0-9]+.*\\.zip"))
-        | .name
-        | sub("\\.zip$"; "")
-    '
-
-    LATEST_RELEASE_ASSET_BASENAME=$(echo "$LATEST_RELEASE_META" | jq -r "$filter" | head -n 1)
-    LATEST_RELEASE_TAG=$(echo "$LATEST_RELEASE_META" | jq -r '.tag_name')
-
-    if [[ -z "$LATEST_RELEASE_ASSET_BASENAME" ]]; then
-        die $EXIT_ERROR $LINENO "Could not find valid be-BOP release asset in GitHub response"
-    fi
-
-    log_debug "Latest release: $LATEST_RELEASE_TAG ($LATEST_RELEASE_ASSET_BASENAME)"
-}
-
 # This function retrieves all be-BOP releases from GitHub and extracts latest release metadata
 # This function exports the following variables:
 #   - ALL_RELEASES_SUMMARY: An opinionated summary of some be-BOP releases suitable for display
-#   - LATEST_RELEASE_META: The latest be-BOP release metadata (JSON, extracted from first release)
-#   - LATEST_RELEASE_ASSET_BASENAME: The basename of the latest be-BOP release asset
-#   - LATEST_RELEASE_TAG: The tag name of the latest release (e.g., rel/2025-12-17/bfe5008)
+#   - RELEASE_META: The latest be-BOP release metadata (JSON, extracted from first release)
 #
 # If we're unable to retrieve the release information, this function will die with an error.
 fetch_all_releases() {
@@ -291,7 +267,6 @@ fetch_all_releases() {
 
     local url="https://api.github.com/repos/${BEBOP_GITHUB_REPO}/releases"
     local releases_data
-
     if ! releases_data="$(curl "${curl_args[@]}" "$url" 2>/dev/null)"; then
         die $EXIT_ERROR $LINENO "Failed to fetch releases from GitHub. Please check your internet connection."
     fi
@@ -303,31 +278,40 @@ fetch_all_releases() {
     # Export latest release metadata from the releases data
     local jq_filter1='.[] | "\(.tag_name) - \(.name) (\(.published_at | split("T")[0]))"'
     export ALL_RELEASES_SUMMARY="$(echo "$releases_data" | jq -r "$jq_filter1")"
-    export LATEST_RELEASE_META=$(echo "$releases_data" | jq '.[0]')
-    local filter='
-        .assets[]
-        | select(.name | test("be-BOP\\.release\\.[0-9]{4}-[0-9]{2}-[0-9]{2}\\.[a-f0-9]+.*\\.zip"))
-        | .name
-        | sub("\\.zip$"; "")
+    local jq_filter2='
+      .[]
+      | (.assets |= map(
+        select(.name | test("be-BOP\\.release\\.[0-9]{4}-[0-9]{2}-[0-9]{2}\\.[a-f0-9]+.*\\.zip"))
+        | {name, browser_download_url}))
+      | {
+        tag_name,
+        name,
+        published_at: (.published_at | split("T")[0]),
+        asset_name: .assets[0].name, asset_url: .assets[0].browser_download_url
+      }
     '
-    export LATEST_RELEASE_ASSET_BASENAME=$(echo "$LATEST_RELEASE_META" | jq -r "$filter" | head -n 1)
-    export LATEST_RELEASE_TAG=$(echo "$LATEST_RELEASE_META" | jq -r '.tag_name')
-
-    if [[ -z "$LATEST_RELEASE_ASSET_BASENAME" ]]; then
+    export RELEASE_META="$(echo "$releases_data" | jq -r "$jq_filter2" | jq -s)"
+    if [[ -z "$RELEASE_META" ]]; then
         die $EXIT_ERROR $LINENO "Could not find valid be-BOP release asset in GitHub response"
     fi
+    local latest_release_name="$(echo "$RELEASE_META" | jq -r '.[0].name')"
+    local latest_release_tag="$(echo "$RELEASE_META" | jq -r '.[0].tag_name')"
 
-    log_debug "Latest release: $LATEST_RELEASE_TAG ($LATEST_RELEASE_ASSET_BASENAME)"
+    log_debug "Latest release: $latest_release_name ($latest_release_tag)"
 }
 
 list_releases() {
     log_info "Fetching available be-BOP releases..."
+    # Always fetch the latest release info
     fetch_all_releases
 
     local current_installed=""
     if [[ -L /var/lib/be-BOP/releases/current ]]; then
         current_installed="$(basename "$(readlink -f /var/lib/be-BOP/releases/current)")"
     fi
+    local latest_name="$(echo "$RELEASE_META" | jq -r '.[0].name')"
+    local latest_asset="$(echo "$RELEASE_META" | jq -r '.[0].asset_name | sub("\\.zip$"; "")')"
+    local latest_tag="$(echo "$RELEASE_META" | jq -r '.[0].tag_name')"
 
     echo ""
     echo "Available be-BOP releases:"
@@ -335,36 +319,54 @@ list_releases() {
     echo ""
 
     if [[ -n "$current_installed" ]]; then
-        if [[ "$current_installed" = "$LATEST_RELEASE_ASSET_BASENAME" ]]; then
-            echo "Current installation: ✓ $LATEST_RELEASE_TAG (latest)"
+        if [[ "$current_installed" = "$latest_asset" ]]; then
+            echo "Current installation: ✓ $latest_asset ($latest_tag - $latest_name)"
         else
             echo "Current installation: $current_installed"
-            echo "Latest available: ⚠ $LATEST_RELEASE_TAG (update available)"
+            echo "Latest available: ⚠ $latest_asset ($latest_tag - $latest_name)"
         fi
     else
         echo "Current installation: ✗ No be-BOP release installed"
-        echo "Latest available: $LATEST_RELEASE_TAG"
+        echo "Latest available: $latest_tag"
     fi
 }
 
 install_release() {
     local target_version="${RELEASE_VERSION:-}"
 
-    if [[ -n "$target_version" ]]; then
-        log_info "Installing be-BOP release: $target_version"
-        die $EXIT_ERROR $LINENO "Specific version installation not yet implemented. Use 'release install' without version to install latest."
-    else
-        log_info "Installing latest be-BOP release..."
+    # Fetch the latest release info if not already available
+    if [[ -z "${RELEASE_META:-}" ]]; then
+        fetch_all_releases
     fi
 
-    # Get latest release info if not already available
-    if [[ -z "${LATEST_RELEASE_META:-}" ]]; then
-        determine_latest_release_meta
+    local target_url;
+    local target_name;
+    case "$target_version" in
+      ""|latest)
+        target_url="$(echo "$RELEASE_META" | jq -r '.[0].asset_url')"
+        target_name="$(echo "$RELEASE_META" | jq -r '.[0].asset_name | sub("\\.zip$"; "")')"
+        ;;
+      branch=*)
+        branch_name="${target_version#branch=}"
+        # Apply GitHub's excaping rules
+        branch_name="${branch_name//\//__}"
+        target_url="https://www.artifact.ci/artifact/view/be-BOP-io-SA/be-BOP/branch/$branch_name/be-BOP-release/be-BOP-release.zip"
+        target_name="$branch_name"
+        ;;
+      *)
+        local target_meta="$(echo "$RELEASE_META" | jq -r 'first(.[]|select(.tag_name == "'"$target_version"'"))')"
+        target_url="$(echo "$target_meta" | jq -r '.asset_url')"
+        target_name="$(echo "$target_meta" | jq -r '.asset_name | sub("\\.zip$"; "")')"
+        ;;
+    esac
+
+    if [[ -z "$target_url" || "$target_url" = "null" ]]; then
+        die_unknown_release "$target_version"
     fi
 
-    local TARGET_DIR="/var/lib/be-BOP/releases/${LATEST_RELEASE_ASSET_BASENAME}"
-    if [[ -d "$TARGET_DIR" ]] && [[ -f "$TARGET_DIR/.bebop_install_success" ]]; then
-        log_info "Latest be-BOP release is already installed"
+    local target_dir="/var/lib/be-BOP/releases/${target_name}"
+    if [[ -d "$target_dir" ]] && [[ -f "$target_dir/.bebop_install_success" ]]; then
+        log_info "The specified be-BOP release is already installed"
         return 0
     fi
 
@@ -374,15 +376,8 @@ install_release() {
     trap "rm -rf $TMPDIR" RETURN 2>/dev/null || true
     pushd "$TMPDIR" > /dev/null
 
-    local filter='.assets[] | select(.name == "'"$LATEST_RELEASE_ASSET_BASENAME"'.zip") | .browser_download_url'
-    local LATEST_RELEASE_URL=$(echo "$LATEST_RELEASE_META" | jq -r "$filter")
-
-    if [[ -z "$LATEST_RELEASE_URL" || "$LATEST_RELEASE_URL" = "null" ]]; then
-        die $EXIT_ERROR $LINENO "Could not find download URL for be-BOP release ${LATEST_RELEASE_ASSET_BASENAME}"
-    fi
-
-    log_info "Downloading ${LATEST_RELEASE_ASSET_BASENAME} from GitHub..."
-    log_debug "Download URL: ${LATEST_RELEASE_URL}"
+    log_info "Downloading release ${target_dir}..."
+    log_debug "Download URL: ${target_url}"
     local curl_args=(
         "--connect-timeout" "$CURL_CONNECT_TIMEOUT"
         "--fail"
@@ -390,32 +385,32 @@ install_release() {
         "--max-time" "$CURL_DOWNLOAD_TIMEOUT"
         "--progress-bar"
         "--show-error"
-        "--output" "be-BOP-latest.zip"
+        "--output" "be-BOP-update.zip"
     )
-    if ! curl "${curl_args[@]}" "$LATEST_RELEASE_URL"; then
+    if ! curl "${curl_args[@]}" "$target_url"; then
         die $EXIT_ERROR $LINENO "Failed to download be-BOP release. Please check your internet connection."
     fi
 
     log_debug "Extracting be-BOP release archive..."
-    if ! unzip -q be-BOP-latest.zip; then
+    if ! unzip -q be-BOP-update.zip; then
         die $EXIT_ERROR $LINENO "Failed to extract be-BOP release archive"
     fi
 
-    local EXTRACTED_DIR=$(find . -maxdepth 1 -type d -name "be-BOP release *" | head -1)
-    if [[ -z "$EXTRACTED_DIR" ]]; then
+    local extracted_dir=$(find . -maxdepth 1 -type d -name "be-BOP release *" | head -1)
+    if [[ -z "$extracted_dir" ]]; then
         die $EXIT_ERROR $LINENO "Could not find extracted directory for be-BOP release"
     fi
 
-    if [[ -d "$TARGET_DIR" ]]; then
-        log_debug "Removing existing installation directory"
-        rm -rf "$TARGET_DIR"
+    if [[ -d "$target_dir" ]]; then
+        log_debug "Removing stalled installation directory ($target_dir)"
+        rm -rf "$target_dir"
     fi
-    mkdir -p "$(dirname "$TARGET_DIR")"
-    mv "$EXTRACTED_DIR" "$TARGET_DIR"
+    mkdir -p "$(dirname "$target_dir")"
+    mv "$extracted_dir" "$target_dir"
 
     # Install dependencies
-    log_info "Installing be-BOP ${LATEST_RELEASE_ASSET_BASENAME} dependencies..."
-    pushd "$TARGET_DIR" > /dev/null
+    log_info "Installing be-BOP ${target_dir} dependencies..."
+    pushd "$target_dir" > /dev/null
     if ! corepack enable; then
         die $EXIT_ERROR $LINENO "Failed to enable corepack"
     fi
@@ -434,7 +429,7 @@ install_release() {
     popd > /dev/null
     rm -rf "$TMPDIR"
 
-    log_info "Latest be-BOP release installed successfully at ${TARGET_DIR}!"
+    log_info "Latest be-BOP release installed successfully at ${target_dir}!"
 
     # Create current symlink
     if [[ -L /var/lib/be-BOP/releases/current ]]; then
@@ -442,7 +437,7 @@ install_release() {
     elif [[ -e /var/lib/be-BOP/releases/current ]]; then
         die $EXIT_ERROR $LINENO "Something unknown is blocking the creation of /var/lib/be-BOP/releases/current symlink. Please check what exists at this path and remove it manually."
     fi
-    ln -sf "$LATEST_RELEASE_ASSET_BASENAME" /var/lib/be-BOP/releases/current
+    ln -sf "$target_dir" /var/lib/be-BOP/releases/current
 
     # Restart be-BOP service after installation (unless disabled)
     if [[ "$NO_RESTART_AFTER_INSTALL" = false ]]; then
@@ -471,8 +466,6 @@ install_release() {
 show_status() {
     local exit_code=0
     local current_installed=""
-    local latest_tag=""
-    local latest_basename=""
 
     echo "be-BOP Status:"
     echo ""
@@ -494,21 +487,22 @@ show_status() {
     fi
 
     # Always check latest release info for status display
-    if determine_latest_release_meta 2>/dev/null; then
-        latest_tag="$LATEST_RELEASE_TAG"
-        latest_basename="$LATEST_RELEASE_ASSET_BASENAME"
+    if fetch_all_releases 2>/dev/null; then
+        local latest_name="$(echo "$RELEASE_META" | jq -r '.[0].name')"
+        local latest_tag="$(echo "$RELEASE_META" | jq -r '.[0].tag_name')"
+        local latest_asset="$(echo "$RELEASE_META" | jq -r '.[0].asset_name | sub("\\.zip$"; "")')"
 
         if [[ -n "$current_installed" ]]; then
-            if [[ "$current_installed" = "$latest_basename" ]]; then
-                echo "Version status: ✓ Latest version installed ($latest_tag)"
+            if [[ "$current_installed" = "$latest_asset" ]]; then
+                echo "Version status: ✓ Latest version installed: $latest_asset ($latest_tag - $latest_name)"
             else
-                echo "Version status: ⚠ Newer version available ($latest_tag)"
+                echo "Version status: ⚠ A new version is available: $latest_asset ($latest_tag - $latest_name)"
                 if [[ "$FAIL_IF_LATEST_NOT_INSTALLED" = true ]]; then
                     exit_code=2
                 fi
             fi
         else
-            echo "Version status: ✗ Latest version not installed ($latest_tag)"
+            echo "Version status: ✗ A new version is available: $latest_asset ($latest_tag - $latest_name)"
             if [[ "$FAIL_IF_LATEST_NOT_INSTALLED" = true ]]; then
                 exit_code=1
             fi
