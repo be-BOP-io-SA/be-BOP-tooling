@@ -16,7 +16,7 @@ jobs:
       - name: Install tooling
         run: |
           sudo apt-get update
-          sudo apt-get install -y just
+          sudo apt-get install -y just makeself
       - name: Build release artifact
         run: |
           just
