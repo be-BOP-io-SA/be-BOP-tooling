@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.5.5"
+readonly SCRIPT_VERSION="2.5.6"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -1322,6 +1322,10 @@ plan_setup_tasks() {
        [[ "$(get_fact nginx_config_fingerprint)" != "$(wizard_file_fingerprint nginx_config)" ]]; then
         [[ ! "${TASK_PLAN[*]}" =~ configure_bebop_site ]] && TASK_PLAN+=("configure_bebop_site")
         has_fact nginx_running && TASK_PLAN+=("reload_nginx")
+        local domain
+        if domain="$(get_fact "specified_domain")" && [[ "$domain" != "localhost" ]]; then
+            [[ ! "${TASK_PLAN[*]}" =~ provision_ssl_cert ]] && TASK_PLAN+=("provision_ssl_cert")
+        fi
     fi
 
     if ! has_fact "phoenixd_running"; then
