@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.5.3"
+readonly SCRIPT_VERSION="2.5.4"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -892,7 +892,7 @@ inspect_system_state() {
 
     # Check be-BOP directory permissions
     if has_fact "bebop_cli_user_exists" && [[ -d /var/lib/be-BOP ]]; then
-        if [[ -n "$(find /var/lib/be-BOP -not -user be-bop-cli -o -not -group be-bop-cli)" ]]; then
+        if [[ -z "$(find /var/lib/be-BOP -not -user be-bop-cli -o -not -group be-bop-cli)" ]]; then
             SYSTEM_STATE+=("bebop_directory_permissions_correct")
         fi
     fi
