@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.5.6"
+readonly SCRIPT_VERSION="2.5.7"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -598,6 +598,21 @@ inspect_system_state() {
 
     # Initialize system facts array
     export SYSTEM_STATE=()
+
+    # Track if domain was explicitly provided via CLI (before auto-detection)
+    if [[ -n "${DOMAIN:-}" ]]; then
+        SYSTEM_STATE+=("domain_explicitly_provided")
+    fi
+
+    # Auto-detect domain from existing config if not provided via CLI
+    if [[ -z "${DOMAIN:-}" ]] && [[ -f /etc/be-BOP/config.env ]]; then
+        local detected_domain
+        detected_domain=$(grep '^ORIGIN=' /etc/be-BOP/config.env | sed 's|ORIGIN=https\?://||')
+        if [[ -n "$detected_domain" ]]; then
+            DOMAIN="$detected_domain"
+            log_info "Detected domain from existing configuration: $DOMAIN"
+        fi
+    fi
 
     if [[ -n "${DOMAIN:-}" ]]; then
         SYSTEM_STATE+=("specified_domain=${DOMAIN}")
@@ -1390,6 +1405,14 @@ plan_setup_tasks() {
     if [[ "${TASK_PLAN[*]}" =~ "start_and_enable_bebop" ]] || [[ "${TASK_PLAN[*]}" =~ "restart_bebop" ]]; then
         if has_fact "specified_domain"; then
             TASK_PLAN+=("await_bebop_ready")
+        fi
+    fi
+
+    # When domain is explicitly provided, always re-provision SSL cert
+    if has_fact "domain_explicitly_provided"; then
+        local domain="$(get_fact "specified_domain")"
+        if [[ "$domain" != "localhost" ]]; then
+            [[ ! "${TASK_PLAN[*]}" =~ provision_ssl_cert ]] && TASK_PLAN+=("provision_ssl_cert")
         fi
     fi
 
