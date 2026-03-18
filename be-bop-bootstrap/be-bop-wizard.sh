@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.5.8"
+readonly SCRIPT_VERSION="2.5.9"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -622,7 +622,7 @@ inspect_system_state() {
     if [[ -z "${EMAIL:-}" ]] && [[ -d /etc/letsencrypt/accounts ]]; then
         local detected_email
         detected_email=$(grep -roh '"mailto:[^"]*"' /etc/letsencrypt/accounts/ 2>/dev/null \
-            | head -1 | sed 's/"mailto:\(.*\)"/\1/')
+            | head -1 | sed 's/"mailto:\(.*\)"/\1/' || true)
         if [[ -n "$detected_email" ]]; then
             EMAIL="$detected_email"
             log_info "Detected email from existing Let's Encrypt account: $EMAIL"
