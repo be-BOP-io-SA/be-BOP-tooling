@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.5.9"
+readonly SCRIPT_VERSION="2.5.10"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -619,9 +619,9 @@ inspect_system_state() {
     fi
 
     # Auto-detect email from certbot account if not provided via CLI
-    if [[ -z "${EMAIL:-}" ]] && [[ -d /etc/letsencrypt/accounts ]]; then
+    if [[ -z "${EMAIL:-}" ]] && run_privileged test -d /etc/letsencrypt/accounts 2>/dev/null; then
         local detected_email
-        detected_email=$(grep -roh '"mailto:[^"]*"' /etc/letsencrypt/accounts/ 2>/dev/null \
+        detected_email=$(run_privileged grep -roh '"mailto:[^"]*"' /etc/letsencrypt/accounts/ 2>/dev/null \
             | head -1 | sed 's/"mailto:\(.*\)"/\1/' || true)
         if [[ -n "$detected_email" ]]; then
             EMAIL="$detected_email"
