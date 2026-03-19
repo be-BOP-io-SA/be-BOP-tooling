@@ -1726,7 +1726,7 @@ summarize_state_and_plan() {
 
     echo ""
     echo "=========================================="
-    echo "be-BOP Installation Plan"
+    echo "be-BOP Installation Plan (test)"
     echo "=========================================="
     local domain email
     if domain="$(get_fact "specified_domain")"; then
