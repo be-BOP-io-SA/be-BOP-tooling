@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.5.11"
+readonly SCRIPT_VERSION="2.5.12"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -573,7 +573,7 @@ wizard_file_fingerprint() {
     local template_rev
     case "${1:-bebop_config}" in
         bebop_config) template_rev="2026022302" ;;
-        nginx_config) template_rev="2026022301" ;;
+        nginx_config) template_rev="2026031901" ;;
         bebop_cli_wrapper) template_rev="2026010601" ;;
         bebop_cli_sudoers) template_rev="2026010601" ;;
     esac
