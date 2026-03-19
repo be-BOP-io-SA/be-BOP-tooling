@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.5.10"
+readonly SCRIPT_VERSION="2.5.11"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -2118,6 +2118,19 @@ server {
 
     proxy_set_header "Connection" "";
 
+    # SSE endpoints - long-lived connections for real-time sync
+    location ~ /sse$ {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_set_header Connection '';
+        proxy_http_version 1.1;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header Host $http_host;
+    }
+
     location / {
         proxy_pass http://localhost:3000;
         proxy_set_header Host $host;
@@ -2198,6 +2211,19 @@ server {
     ssl_stapling on;
     ssl_stapling_verify on;
     proxy_set_header "Connection" "";
+
+    # SSE endpoints - long-lived connections for real-time sync
+    location ~ /sse$ {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_set_header Connection '';
+        proxy_http_version 1.1;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header Host $http_host;
+    }
 
     location / {
         proxy_pass http://localhost:3000;
