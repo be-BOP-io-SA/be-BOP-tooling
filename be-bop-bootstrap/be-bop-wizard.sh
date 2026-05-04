@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.5.3"
+readonly SCRIPT_VERSION="2.5.12"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -73,7 +73,7 @@ readonly SERVICE_TEST_START_WAIT_SECONDS=3
 readonly NODEJS_MAJOR_VERSION=22
 readonly MONGODB_VERSION="8.0"
 readonly PHOENIXD_VERSION="0.6.2"
-readonly MINIO_VERSION="RELEASE.2025-09-07T16-13-09Z"
+readonly GARAGE_VERSION="2.2.0"
 
 # Error trap handler
 die_unexpected_error_in_function() {
@@ -572,8 +572,8 @@ wizard_file_fingerprint() {
     # The value is currently internal, but may be exposed in the future.
     local template_rev
     case "${1:-bebop_config}" in
-        bebop_config) template_rev="2025101602" ;;
-        nginx_config) template_rev="2025112601" ;;
+        bebop_config) template_rev="2026022302" ;;
+        nginx_config) template_rev="2026031901" ;;
         bebop_cli_wrapper) template_rev="2026010601" ;;
         bebop_cli_sudoers) template_rev="2026010601" ;;
     esac
@@ -599,8 +599,34 @@ inspect_system_state() {
     # Initialize system facts array
     export SYSTEM_STATE=()
 
+    # Track if domain was explicitly provided via CLI (before auto-detection)
+    if [[ -n "${DOMAIN:-}" ]]; then
+        SYSTEM_STATE+=("domain_explicitly_provided")
+    fi
+
+    # Auto-detect domain from existing config if not provided via CLI
+    if [[ -z "${DOMAIN:-}" ]] && [[ -f /etc/be-BOP/config.env ]]; then
+        local detected_domain
+        detected_domain=$(grep '^ORIGIN=' /etc/be-BOP/config.env | sed 's|ORIGIN=https\?://||')
+        if [[ -n "$detected_domain" ]]; then
+            DOMAIN="$detected_domain"
+            log_info "Detected domain from existing configuration: $DOMAIN"
+        fi
+    fi
+
     if [[ -n "${DOMAIN:-}" ]]; then
         SYSTEM_STATE+=("specified_domain=${DOMAIN}")
+    fi
+
+    # Auto-detect email from certbot account if not provided via CLI
+    if [[ -z "${EMAIL:-}" ]] && run_privileged test -d /etc/letsencrypt/accounts 2>/dev/null; then
+        local detected_email
+        detected_email=$(run_privileged grep -roh '"mailto:[^"]*"' /etc/letsencrypt/accounts/ 2>/dev/null \
+            | head -1 | sed 's/"mailto:\(.*\)"/\1/' || true)
+        if [[ -n "$detected_email" ]]; then
+            EMAIL="$detected_email"
+            log_info "Detected email from existing Let's Encrypt account: $EMAIL"
+        fi
     fi
 
     if [[ -n "${EMAIL:-}" ]]; then
@@ -782,26 +808,19 @@ inspect_system_state() {
         SYSTEM_STATE+=("certbot_installed")
     fi
 
-    if has_tool systemctl && systemctl is-active --quiet minio 2>/dev/null; then
-        SYSTEM_STATE+=("minio_running")
+    if has_tool systemctl && systemctl is-active --quiet garage 2>/dev/null; then
+        SYSTEM_STATE+=("garage_running")
     fi
 
-    # Check if MinIO is available but service not running (try HTTP check as fallback)
-    if has_tool curl && ! has_fact "minio_running"; then
-        # Check if MinIO is responding via HTTP (even if systemctl doesn't show it as active)
-        local curl_args=(
-            "--connect-timeout" "$CURL_CONNECT_TIMEOUT"
-            "--fail"
-            "--max-time" "$CURL_DOWNLOAD_TIMEOUT"
-            "--output" "/dev/null"
-            "--silent"
-            "--write-out" "%{http_code}"
-        )
-        local url="http://localhost:9000/minio/health/live"
-        local minio_response=$(curl "${curl_args[@]}" "$url" 2>/dev/null || echo "000")
-        if [[ "$minio_response" =~ ^[234][0-9][0-9]$ ]]; then
-            SYSTEM_STATE+=("minio_running")
-        fi
+    # Detect existing MinIO (for migration)
+    if [[ -f /usr/local/bin/minio ]]; then
+        SYSTEM_STATE+=("legacy_minio_installed")
+    fi
+    if has_tool systemctl && systemctl is-active --quiet minio 2>/dev/null; then
+        SYSTEM_STATE+=("legacy_minio_running")
+    fi
+    if [[ -f /etc/garage/migration-from-minio.done ]]; then
+        SYSTEM_STATE+=("minio_migration_verified")
     fi
 
     if has_tool systemctl && systemctl is-active --quiet bebop 2>/dev/null; then
@@ -816,8 +835,8 @@ inspect_system_state() {
         SYSTEM_STATE+=("phoenixd_installed")
     fi
 
-    if [[ -f /usr/local/bin/minio ]]; then
-        SYSTEM_STATE+=("minio_installed")
+    if [[ -f /usr/local/bin/garage ]]; then
+        SYSTEM_STATE+=("garage_installed")
     fi
 
     if has_tool systemctl && systemctl is-active --quiet phoenixd 2>/dev/null; then
@@ -843,11 +862,15 @@ inspect_system_state() {
         fi
     fi
 
-    if [[ -f /etc/minio/config.env ]]; then
-        SYSTEM_STATE+=("minio_config_exists")
-        if ! validate_minio_config_domain; then
-            SYSTEM_STATE+=("minio_config_domain_mismatch")
+    if [[ -f /etc/garage.toml ]]; then
+        SYSTEM_STATE+=("garage_config_exists")
+        if ! validate_garage_config_domain; then
+            SYSTEM_STATE+=("garage_config_domain_mismatch")
         fi
+    fi
+
+    if has_tool garage && garage key list 2>/dev/null | grep -q "bebop-key"; then
+        SYSTEM_STATE+=("garage_provisioned")
     fi
 
     if [[ -f /etc/be-BOP/config.env ]]; then
@@ -865,14 +888,17 @@ inspect_system_state() {
 
     if [[ -f /etc/systemd/system/bebop.service ]]; then
         SYSTEM_STATE+=("bebop_service_exists")
+        if grep -q "minio" /etc/systemd/system/bebop.service 2>/dev/null; then
+            SYSTEM_STATE+=("bebop_service_depends_on_minio")
+        fi
     fi
 
     if [[ -f /etc/systemd/system/phoenixd.service.d/overrides.conf ]]; then
         SYSTEM_STATE+=("phoenixd_overrides_exist")
     fi
 
-    if [[ -f /etc/systemd/system/minio.service.d/overrides.conf ]]; then
-        SYSTEM_STATE+=("minio_overrides_exist")
+    if [[ -f /etc/systemd/system/garage.service.d/overrides.conf ]]; then
+        SYSTEM_STATE+=("garage_overrides_exist")
     fi
 
     if [[ -f /etc/systemd/system/bebop.service.d/overrides.conf ]]; then
@@ -892,7 +918,7 @@ inspect_system_state() {
 
     # Check be-BOP directory permissions
     if has_fact "bebop_cli_user_exists" && [[ -d /var/lib/be-BOP ]]; then
-        if [[ -n "$(find /var/lib/be-BOP -not -user be-bop-cli -o -not -group be-bop-cli)" ]]; then
+        if [[ -z "$(find /var/lib/be-BOP -not -user be-bop-cli -o -not -group be-bop-cli)" ]]; then
             SYSTEM_STATE+=("bebop_directory_permissions_correct")
         fi
     fi
@@ -947,26 +973,25 @@ validate_bebop_nginx_config_domains() {
     return 0
 }
 
-validate_minio_config_domain() {
-    if [[ ! -f /etc/minio/config.env ]]; then
+validate_garage_config_domain() {
+    if [[ ! -f /etc/garage.toml ]]; then
         return 1
     fi
 
     local domain
     if ! domain="$(get_fact "specified_domain")"; then
-        log_debug "Cannot validate minio config, as the domain was not specified"
+        log_debug "Cannot validate Garage config, as the domain was not specified"
         return 0
     fi
 
-    local expected_url
+    # For localhost, Garage config doesn't set root_domain so nothing to validate
     if [[ "$domain" = "localhost" ]]; then
-        expected_url="http://s3.localhost"
-    else
-        expected_url="https://s3.$domain"
+        return 0
     fi
 
-    if ! grep -q "^MINIO_SERVER_URL=$expected_url$" /etc/minio/config.env 2>/dev/null; then
-        log_debug "MinIO config has incorrect server URL (expected: $expected_url)"
+    local expected_root_domain="s3.$domain"
+    if ! grep -q "root_domain.*=.*\"$expected_root_domain\"" /etc/garage.toml 2>/dev/null; then
+        log_debug "Garage config has incorrect root_domain (expected: $expected_root_domain)"
         return 1
     fi
 
@@ -1247,24 +1272,34 @@ plan_setup_tasks() {
         TASK_PLAN+=("enable_corepack")
     fi
 
-    if ! has_fact "minio_installed"; then
-        TASK_PLAN+=("install_minio")
+    if ! has_fact "garage_installed"; then
+        TASK_PLAN+=("install_garage")
     fi
 
-    # Configure MinIO (needed for be-BOP config)
-    if ! has_fact "minio_config_exists" || has_fact "minio_config_domain_mismatch"; then
-        TASK_PLAN+=("write_minio_configuration")
-        if has_fact "minio_running"; then
-            TASK_PLAN+=("restart_minio")
-        fi
+    # Configure Garage (needed for be-BOP config)
+    if ! has_fact "garage_config_exists" || has_fact "garage_config_domain_mismatch"; then
+        TASK_PLAN+=("write_garage_configuration")
     fi
 
-    if ! has_fact "minio_running"; then
-        TASK_PLAN+=("install_minio_service")
-        if ! has_fact "running_in_container" && ! has_fact "minio_overrides_exist"; then
-            TASK_PLAN+=("configure_minio_hardening_overrides")
+    if ! has_fact "garage_running"; then
+        TASK_PLAN+=("install_garage_service")
+        if ! has_fact "running_in_container" && ! has_fact "garage_overrides_exist"; then
+            TASK_PLAN+=("configure_garage_hardening_overrides")
         fi
-        TASK_PLAN+=("start_and_enable_minio")
+        TASK_PLAN+=("start_and_enable_garage")
+    fi
+
+    if ! has_fact "garage_provisioned"; then
+        TASK_PLAN+=("provision_garage")
+    fi
+
+    # Migrate data from legacy MinIO and remove it
+    if has_fact "legacy_minio_running" && ! has_fact "minio_migration_verified"; then
+        TASK_PLAN+=("migrate_minio_to_garage")
+    fi
+    if has_fact "legacy_minio_running" || \
+       (has_fact "legacy_minio_installed" && has_fact "minio_migration_verified"); then
+        TASK_PLAN+=("remove_legacy_minio")
     fi
 
     # Smart cascading logic for MongoDB
@@ -1313,6 +1348,10 @@ plan_setup_tasks() {
        [[ "$(get_fact nginx_config_fingerprint)" != "$(wizard_file_fingerprint nginx_config)" ]]; then
         [[ ! "${TASK_PLAN[*]}" =~ configure_bebop_site ]] && TASK_PLAN+=("configure_bebop_site")
         has_fact nginx_running && TASK_PLAN+=("reload_nginx")
+        local domain
+        if domain="$(get_fact "specified_domain")" && [[ "$domain" != "localhost" ]]; then
+            [[ ! "${TASK_PLAN[*]}" =~ provision_ssl_cert ]] && TASK_PLAN+=("provision_ssl_cert")
+        fi
     fi
 
     if ! has_fact "phoenixd_running"; then
@@ -1342,7 +1381,7 @@ plan_setup_tasks() {
         TASK_PLAN+=("install_bebop_cli_sudoers")
     fi
 
-    if ! has_fact "bebop_service_exists"; then
+    if ! has_fact "bebop_service_exists" || has_fact "bebop_service_depends_on_minio"; then
         TASK_PLAN+=("install_bebop_service")
         if ! has_fact "running_in_container" && ! has_fact "bebop_overrides_exist"; then
             TASK_PLAN+=("configure_bebop_hardening_overrides")
@@ -1380,6 +1419,14 @@ plan_setup_tasks() {
         fi
     fi
 
+    # When domain is explicitly provided, always re-provision SSL cert
+    if has_fact "domain_explicitly_provided"; then
+        local domain="$(get_fact "specified_domain")"
+        if [[ "$domain" != "localhost" ]]; then
+            [[ ! "${TASK_PLAN[*]}" =~ provision_ssl_cert ]] && TASK_PLAN+=("provision_ssl_cert")
+        fi
+    fi
+
     log_debug "Planned actions: ${TASK_PLAN[*]}"
 }
 
@@ -1388,7 +1435,7 @@ check_options_required_by_planned_tasks_but_missing() {
     export TASKS_REQUIRING_OPTIONS=()
     for task in "${TASK_PLAN[@]}"; do
         case "$task" in
-            "configure_bebop_site"|"write_bebop_configuration"|"write_minio_configuration")
+            "configure_bebop_site"|"write_bebop_configuration"|"write_garage_configuration")
                 if ! has_fact "specified_domain"; then
                     REQUIRED_OPTIONS+=("domain")
                     TASKS_REQUIRING_OPTIONS+=("$task")
@@ -1483,10 +1530,11 @@ list_tools_for_task() {
         "configure_nodejs_repo") echo "curl gpg" ;;
         "install_bebop_cli") echo "curl jq unzip sha256sum tcc" ;;
         "install_bebop_cli_sudoers") echo "sudo" ;;
-        "install_minio") echo "curl stow" ;;
+        "install_garage") echo "curl stow" ;;
         "install_phoenixd") echo "curl unzip stow" ;;
+        "migrate_minio_to_garage") echo "rclone" ;;
         "provision_ssl_cert") echo "certbot python3-certbot-nginx" ;;
-        "write_minio_configuration") echo "openssl" ;;
+        "write_garage_configuration") echo "openssl" ;;
         *) echo "" ;;
     esac
 }
@@ -1604,14 +1652,16 @@ summarize_state_and_plan() {
         fi
     }
 
-    minio_state() {
-        if has_fact "minio_config_domain_mismatch"; then
+    garage_state() {
+        if has_fact "garage_config_domain_mismatch"; then
             echo "⚠ configured for different domain (needs reconfiguration)"
-        elif has_fact "minio_running" && has_fact "minio_config_exists"; then
+        elif has_fact "garage_running" && has_fact "garage_config_exists" && has_fact "garage_provisioned"; then
             echo "✓ running"
-        elif has_fact "minio_running"; then
+        elif has_fact "garage_running" && has_fact "garage_config_exists"; then
+            echo "⚠ running but not provisioned"
+        elif has_fact "garage_running"; then
             echo "⚠ running but not configured"
-        elif has_fact "minio_installed"; then
+        elif has_fact "garage_installed"; then
             echo "⚠ installed but not running"
         else
             echo "✗ missing"
@@ -1697,7 +1747,7 @@ summarize_state_and_plan() {
     echo "  • nginx: $(nginx_state)"
     echo "  • SSL certificate: $(ssl_state)"
     echo "  • phoenixd: $(phoenixd_state)"
-    echo "  • MinIO: $(minio_state)"
+    echo "  • Garage: $(garage_state)"
     echo "  • be-BOP CLI: $(cli_state)"
     echo "  • be-BOP: $(bebop_state)"
     echo "  • Security hardening: $(hardening_state)"
@@ -1743,19 +1793,21 @@ prompt_user_confirmation() {
 task_requires_systemd_operational() {
     case "$1" in
         configure_bebop_hardening_overrides) ;;
-        configure_minio_hardening_overrides) ;;
+        configure_garage_hardening_overrides) ;;
         configure_phoenixd_hardening_overrides) ;;
         initialize_mongodb_rs) ;;
         install_bebop_service) ;;
-        install_minio_service) ;;
+        install_garage_service) ;;
         install_phoenixd_service) ;;
+        provision_garage) ;;
         reload_nginx) ;;
         restart_bebop) ;;
-        restart_minio) ;;
+        restart_garage) ;;
         start_and_enable_bebop) ;;
-        start_and_enable_minio) ;;
+        start_and_enable_garage) ;;
         start_and_enable_nginx) ;;
         start_and_enable_phoenixd) ;;
+        remove_legacy_minio) ;;
         *)
             return 1
             ;;
@@ -1816,7 +1868,7 @@ describe_task() {
         "configure_bebop_cli_user") echo "Configure be-BOP CLI system user" ;;
         "configure_bebop_hardening_overrides") echo "Apply security hardening to be-BOP service" ;;
         "configure_bebop_site") echo "Configure be-BOP nginx site" ;;
-        "configure_minio_hardening_overrides") echo "Apply security hardening to MinIO service" ;;
+        "configure_garage_hardening_overrides") echo "Apply security hardening to Garage service" ;;
         "configure_mongodb_repo") echo "Configure MongoDB 8.0 repository" ;;
         "configure_nodejs_repo") echo "Configure Node.js 22 repository" ;;
         "configure_phoenixd_hardening_overrides") echo "Apply security hardening to phoenixd service" ;;
@@ -1826,24 +1878,27 @@ describe_task() {
         "install_bebop_cli_sudoers") echo "Install be-BOP CLI sudoers rule" ;;
         "install_bebop_latest_release") echo "Install latest be-BOP release" ;;
         "install_bebop_service") echo "Install be-BOP systemd service" ;;
-        "install_minio") echo "Install MinIO object storage server" ;;
-        "install_minio_service") echo "Install MinIO systemd service" ;;
+        "install_garage") echo "Install Garage S3-compatible storage server" ;;
+        "install_garage_service") echo "Install Garage systemd service" ;;
         "install_mongodb") echo "Install MongoDB" ;;
         "install_nodejs") echo "Install Node.js" ;;
         "install_phoenixd") echo "Install phoenixd Lightning Network daemon" ;;
         "install_phoenixd_service") echo "Install phoenixd systemd service" ;;
+        "migrate_minio_to_garage") echo "Migrate data from MinIO to Garage" ;;
+        "provision_garage") echo "Provision Garage storage (layout, key, bucket)" ;;
         "provision_ssl_cert") echo "Provision SSL certificate with Let's Encrypt" ;;
         "reload_nginx") echo "Reload nginx configuration" ;;
         "restart_bebop") echo "Restart be-BOP service" ;;
-        "restart_minio") echo "Restart MinIO service" ;;
+        "restart_garage") echo "Restart Garage service" ;;
         "setup_bebop_directory_permissions") echo "Set up be-BOP directory permissions" ;;
         "start_and_enable_bebop") echo "Start and enable be-BOP service" ;;
-        "start_and_enable_minio") echo "Start and enable MinIO service" ;;
+        "start_and_enable_garage") echo "Start and enable Garage service" ;;
         "start_and_enable_mongodb") echo "Start and enable MongoDB service" ;;
         "start_and_enable_nginx") echo "Start and enable nginx service" ;;
         "start_and_enable_phoenixd") echo "Start and enable phoenixd service" ;;
+        "remove_legacy_minio") echo "Remove legacy MinIO (service, binary, data)" ;;
         "write_bebop_configuration") echo "Write be-BOP configuration" ;;
-        "write_minio_configuration") echo "Write MinIO configuration" ;;
+        "write_garage_configuration") echo "Write Garage configuration" ;;
         *)
             return 1
             ;;
@@ -1862,7 +1917,7 @@ run_task() {
         "configure_bebop_cli_user") configure_bebop_cli_user ;;
         "configure_bebop_hardening_overrides") configure_bebop_hardening_overrides ;;
         "configure_bebop_site") configure_bebop_site ;;
-        "configure_minio_hardening_overrides") configure_minio_hardening_overrides ;;
+        "configure_garage_hardening_overrides") configure_garage_hardening_overrides ;;
         "configure_mongodb_repo") configure_mongodb_repo ;;
         "configure_nodejs_repo") configure_nodejs_repo ;;
         "configure_phoenixd_hardening_overrides") configure_phoenixd_hardening_overrides ;;
@@ -1872,24 +1927,27 @@ run_task() {
         "install_bebop_cli_sudoers") install_bebop_cli_sudoers ;;
         "install_bebop_latest_release") install_bebop_latest_release ;;
         "install_bebop_service") install_bebop_service ;;
-        "install_minio") install_minio ;;
-        "install_minio_service") install_minio_service ;;
+        "install_garage") install_garage ;;
+        "install_garage_service") install_garage_service ;;
         "install_mongodb") install_mongodb ;;
         "install_nodejs") install_nodejs ;;
         "install_phoenixd") install_phoenixd ;;
         "install_phoenixd_service") install_phoenixd_service ;;
+        "migrate_minio_to_garage") migrate_minio_to_garage ;;
+        "provision_garage") provision_garage ;;
         "provision_ssl_cert") provision_ssl_cert ;;
         "reload_nginx") reload_nginx ;;
         "restart_bebop") restart_bebop ;;
-        "restart_minio") restart_minio ;;
+        "restart_garage") restart_garage ;;
         "setup_bebop_directory_permissions") setup_bebop_directory_permissions ;;
         "start_and_enable_bebop") start_and_enable_bebop ;;
-        "start_and_enable_minio") start_and_enable_minio ;;
+        "start_and_enable_garage") start_and_enable_garage ;;
         "start_and_enable_mongodb") start_and_enable_mongodb ;;
         "start_and_enable_nginx") start_and_enable_nginx ;;
         "start_and_enable_phoenixd") start_and_enable_phoenixd ;;
+        "remove_legacy_minio") remove_legacy_minio ;;
         "write_bebop_configuration") write_bebop_configuration ;;
-        "write_minio_configuration") write_minio_configuration ;;
+        "write_garage_configuration") write_garage_configuration ;;
         *) die $EXIT_ERROR $LINENO "Unable to execute task: $1" ;;
     esac
 }
@@ -2060,6 +2118,19 @@ server {
 
     proxy_set_header "Connection" "";
 
+    # SSE endpoints - long-lived connections for real-time sync
+    location ~ /sse$ {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_set_header Connection '';
+        proxy_http_version 1.1;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header Host $http_host;
+    }
+
     location / {
         proxy_pass http://localhost:3000;
         proxy_set_header Host $host;
@@ -2080,7 +2151,7 @@ server {
     client_max_body_size 1000M;
 
     location / {
-        proxy_pass http://localhost:9000;
+        proxy_pass http://localhost:3900;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -2141,6 +2212,19 @@ server {
     ssl_stapling_verify on;
     proxy_set_header "Connection" "";
 
+    # SSE endpoints - long-lived connections for real-time sync
+    location ~ /sse$ {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_set_header Connection '';
+        proxy_http_version 1.1;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header Host $http_host;
+    }
+
     location / {
         proxy_pass http://localhost:3000;
         proxy_set_header Host $host;
@@ -2175,7 +2259,7 @@ server {
     client_max_body_size 1000M;
 
     location / {
-        proxy_pass http://localhost:9000;
+        proxy_pass http://localhost:3900;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -2415,15 +2499,15 @@ EOF
     log_info "be-BOP CLI sudoers rule installed"
 }
 
-install_minio() {
-    log_info "Installing MinIO object storage server..."
+install_garage() {
+    log_info "Installing Garage S3-compatible storage server..."
 
-    local STOW_DIR="/usr/local/minio"
-    local PACKAGE_DIR="$STOW_DIR/minio-${MINIO_VERSION}"
+    local STOW_DIR="/usr/local/garage"
+    local PACKAGE_DIR="$STOW_DIR/garage-v${GARAGE_VERSION}"
 
     # Check if the version directory already exists
     if [[ -d "$PACKAGE_DIR" ]]; then
-        log_info "MinIO ${MINIO_VERSION} already installed in stow directory"
+        log_info "Garage v${GARAGE_VERSION} already installed in stow directory"
     else
         # Create temporary directory for download
         local TEMP_DIR=$(mktemp -d)
@@ -2431,21 +2515,20 @@ install_minio() {
         trap "rm -rf $TEMP_DIR" RETURN 2>/dev/null || true
         pushd "$TEMP_DIR" > /dev/null
 
-        # Download MinIO binary
         local arch_string
-        case "$(uname -m)" in
-          x86_64)
-            arch_string="amd64"
-            ;;
-          aarch64)
-            arch_string="arm64"
-            ;;
-          *)
-            die $EXIT_ERROR $LINENO "Could not find minio binary download URL for your architecture"
-            ;;
+        case "$(get_fact "debian_arch")" in
+            amd64)
+                arch_string="x86_64-unknown-linux-musl"
+                ;;
+            arm64)
+                arch_string="aarch64-unknown-linux-musl"
+                ;;
+            *)
+                die_unexpected_architecture "$(get_fact "debian_arch")"
+                ;;
         esac
-        local MINIO_URL="https://dl.min.io/server/minio/release/linux-$arch_string/archive/minio.${MINIO_VERSION}"
-        log_info "Downloading MinIO ${MINIO_VERSION} from ${MINIO_URL}"
+        local GARAGE_URL="https://garagehq.deuxfleurs.fr/_releases/v${GARAGE_VERSION}/${arch_string}/garage"
+        log_info "Downloading Garage v${GARAGE_VERSION} from ${GARAGE_URL}"
         local curl_args=(
             "--connect-timeout" "$CURL_CONNECT_TIMEOUT"
             "--fail"
@@ -2453,16 +2536,16 @@ install_minio() {
             "--max-time" "$CURL_DOWNLOAD_TIMEOUT"
             "--progress-bar"
             "--show-error"
-            "--output" minio
+            "--output" garage
         )
-        curl "${curl_args[@]}" "$MINIO_URL"
+        curl "${curl_args[@]}" "$GARAGE_URL"
 
         # Create stow directory structure
         run_privileged mkdir -p "$PACKAGE_DIR/bin"
 
-        # Install MinIO binary to stow package directory
-        run_privileged cp minio "$PACKAGE_DIR/bin/"
-        run_privileged chmod +x "$PACKAGE_DIR/bin/minio"
+        # Install Garage binary to stow package directory
+        run_privileged cp garage "$PACKAGE_DIR/bin/"
+        run_privileged chmod +x "$PACKAGE_DIR/bin/garage"
 
         popd > /dev/null
         rm -rf "$TEMP_DIR"
@@ -2470,45 +2553,247 @@ install_minio() {
 
     # Use stow to symlink the binary
     pushd "$STOW_DIR" > /dev/null
-    run_privileged stow "minio-${MINIO_VERSION}"
+    run_privileged stow "garage-v${GARAGE_VERSION}"
     popd > /dev/null
-    log_info "MinIO ${MINIO_VERSION} installed using stow"
+    log_info "Garage v${GARAGE_VERSION} installed using stow"
 }
 
-write_minio_configuration() {
-    log_info "Configuring MinIO with generated credentials..."
+write_garage_configuration() {
+    log_info "Writing Garage configuration..."
     local domain="$(get_fact "specified_domain")"
 
     local TMPDIR=$(mktemp -d)
     # shellcheck disable=SC2064  # TMPDIR should be expanded here (and not on trap).
     trap "rm -rf $TMPDIR" RETURN 2>/dev/null || true
 
-    # Generate MinIO configuration
-    if [[ -f /etc/minio/config.env ]]; then
-        log_debug "Patching domain in existing MinIO configuration"
-        cp /etc/minio/config.env "$TMPDIR/config.env"
-        sed -i "s|^MINIO_SERVER_URL=.*|MINIO_SERVER_URL=https://s3.${domain}|" "$TMPDIR/config.env"
+    # Generate Garage configuration
+    if [[ -f /etc/garage.toml ]]; then
+        log_debug "Patching domain in existing Garage configuration"
+        cp /etc/garage.toml "$TMPDIR/garage.toml"
+        if [[ "$domain" != "localhost" ]]; then
+            sed -i "s|^root_domain.*=.*|root_domain = \"s3.${domain}\"|" "$TMPDIR/garage.toml"
+        fi
     else
-        # Create new configuration with generated credentials
-        cat > "$TMPDIR/config.env" << EOF
-MINIO_ROOT_USER=$(openssl rand -base64 63 | tr -d '\n')
-MINIO_ROOT_PASSWORD=$(openssl rand -base64 63 | tr -d '\n')
-MINIO_SERVER_URL=https://s3.${domain}
+        # Create new configuration with generated RPC secret
+        local rpc_secret
+        rpc_secret=$(openssl rand -hex 32)
+
+        if [[ "$domain" = "localhost" ]]; then
+            cat > "$TMPDIR/garage.toml" << EOF
+metadata_dir = "/var/lib/garage/meta"
+data_dir = "/var/lib/garage/data"
+db_engine = "lmdb"
+replication_factor = 1
+
+rpc_secret = "${rpc_secret}"
+rpc_bind_addr = "127.0.0.1:3901"
+
+[s3_api]
+s3_region = "garage"
+api_bind_addr = "127.0.0.1:3900"
+
+[admin]
+api_bind_addr = "127.0.0.1:3903"
 EOF
+        else
+            cat > "$TMPDIR/garage.toml" << EOF
+metadata_dir = "/var/lib/garage/meta"
+data_dir = "/var/lib/garage/data"
+db_engine = "lmdb"
+replication_factor = 1
+
+rpc_secret = "${rpc_secret}"
+rpc_bind_addr = "127.0.0.1:3901"
+
+[s3_api]
+s3_region = "garage"
+api_bind_addr = "127.0.0.1:3900"
+root_domain = "s3.${domain}"
+
+[admin]
+api_bind_addr = "127.0.0.1:3903"
+EOF
+        fi
     fi
 
-    if [[ "$domain" = "localhost" ]]; then
-        # Don't use https for localhost
-        sed -i 's|MINIO_SERVER_URL=https://|MINIO_SERVER_URL=http://|' "$TMPDIR/config.env"
+    install_file "$TMPDIR/garage.toml" /etc/garage.toml
+    run_privileged chmod 640 /etc/garage.toml
+}
+
+wait_garage_ready() {
+    local retries="$SERVICE_TEST_START_RETRIES"
+    while ! garage status >/dev/null 2>&1; do
+        if [[ $retries -le 0 ]]; then
+            die $EXIT_ERROR $LINENO "Garage did not become ready in time"
+        fi
+        log_debug "Waiting for Garage to become ready... ($retries retries left)"
+        sleep "$SERVICE_TEST_START_WAIT_SECONDS"
+        ((retries--))
+    done
+}
+
+provision_garage() {
+    log_info "Provisioning Garage storage (layout, key, bucket)..."
+
+    wait_garage_ready
+
+    # Get node ID
+    local node_id
+    node_id=$(garage node id 2>/dev/null | cut -d@ -f1)
+    if [[ -z "$node_id" ]]; then
+        die $EXIT_ERROR $LINENO "Could not determine Garage node ID"
+    fi
+    log_debug "Garage node ID: $node_id"
+
+    # Assign layout (only if node has no layout yet)
+    local node_needs_layout=false
+    if garage status 2>/dev/null | grep "${node_id:0:16}" | grep -q "NO ROLE ASSIGNED"; then
+        node_needs_layout=true
+    fi
+    if [[ "$node_needs_layout" == true ]]; then
+        garage layout assign -z dc1 -c 1G "$node_id"
+
+        # Read current layout version and increment
+        local layout_version
+        layout_version=$(garage layout show 2>/dev/null | awk '/Current cluster layout version:/{print $NF}')
+        layout_version=$(( ${layout_version:-0} + 1 ))
+        garage layout apply --version "$layout_version"
+    else
+        log_debug "Node already has layout assigned, skipping"
     fi
 
-    run_privileged mkdir -p /etc/minio
-    install_file "$TMPDIR/config.env" /etc/minio/config.env
-    # Ensure it's world-readable (so the configured domain can be checked)
-    run_privileged chmod 644 /etc/minio/config.env
+    # Create access key and save credentials (only if key does not already exist)
+    if ! garage key list 2>/dev/null | grep -q "bebop-key"; then
+        local key_output
+        key_output=$(garage key create bebop-key 2>&1)
 
-    # Cleanup
-    rm -rf "$TMPDIR"
+        local key_id key_secret
+        key_id=$(echo "$key_output" | grep -oP 'Key ID:\s+\K\S+' || echo "")
+        key_secret=$(echo "$key_output" | grep -oP 'Secret key:\s+\K\S+' || echo "")
+
+        if [[ -z "$key_id" ]] || [[ -z "$key_secret" ]]; then
+            die $EXIT_ERROR $LINENO "Could not create Garage access key"
+        fi
+
+        local TMPDIR=$(mktemp -d)
+        # shellcheck disable=SC2064  # TMPDIR should be expanded here (and not on trap).
+        trap "rm -rf $TMPDIR" RETURN 2>/dev/null || true
+
+        cat > "$TMPDIR/credentials.env" << EOF
+GARAGE_KEY_ID=${key_id}
+GARAGE_KEY_SECRET=${key_secret}
+EOF
+
+        run_privileged mkdir -p /etc/garage
+        install_file "$TMPDIR/credentials.env" /etc/garage/credentials.env
+        run_privileged chmod 600 /etc/garage/credentials.env
+    else
+        log_debug "Garage key 'bebop-key' already exists, skipping key creation"
+    fi
+
+    # Create bucket (only if it does not exist)
+    if ! garage bucket list 2>/dev/null | grep -q "bebop"; then
+        garage bucket create bebop
+        garage bucket allow --read --write --owner bebop --key bebop-key
+    else
+        log_debug "Bucket 'bebop' already exists, skipping"
+    fi
+
+    log_info "Garage provisioned: key 'bebop-key' created, bucket 'bebop' ready"
+}
+
+migrate_minio_to_garage() {
+    log_info "Migrating data from MinIO to Garage..."
+
+    # Read MinIO credentials
+    local minio_user minio_password
+    minio_user="$(run_privileged grep '^MINIO_ROOT_USER=' /etc/minio/config.env 2>/dev/null | cut -d'=' -f2- || echo "")"
+    minio_password="$(run_privileged grep '^MINIO_ROOT_PASSWORD=' /etc/minio/config.env 2>/dev/null | cut -d'=' -f2- || echo "")"
+
+    if [[ -z "$minio_user" ]] || [[ -z "$minio_password" ]]; then
+        log_warn "Could not read MinIO credentials, skipping data migration"
+        return 0
+    fi
+
+    # Read Garage credentials
+    local garage_key_id garage_key_secret
+    garage_key_id="$(run_privileged grep '^GARAGE_KEY_ID=' /etc/garage/credentials.env 2>/dev/null | cut -d'=' -f2- || echo "")"
+    garage_key_secret="$(run_privileged grep '^GARAGE_KEY_SECRET=' /etc/garage/credentials.env 2>/dev/null | cut -d'=' -f2- || echo "")"
+
+    if [[ -z "$garage_key_id" ]] || [[ -z "$garage_key_secret" ]]; then
+        log_warn "Could not read Garage credentials — skipping migration (re-run wizard to retry)"
+        return 0
+    fi
+
+    # Create temporary rclone config
+    local TMPDIR=$(mktemp -d)
+    # shellcheck disable=SC2064  # TMPDIR should be expanded here (and not on trap).
+    trap "rm -rf $TMPDIR" RETURN 2>/dev/null || true
+
+    cat > "$TMPDIR/rclone.conf" << EOF
+[minio]
+type = s3
+provider = Minio
+endpoint = http://localhost:9000
+access_key_id = ${minio_user}
+secret_access_key = ${minio_password}
+
+[garage]
+type = s3
+provider = Other
+endpoint = http://localhost:3900
+access_key_id = ${garage_key_id}
+secret_access_key = ${garage_key_secret}
+region = garage
+EOF
+
+    log_info "Copying data from MinIO to Garage (this may take a while)..."
+    if ! rclone sync minio:bebop garage:bebop --config "$TMPDIR/rclone.conf" --progress 2>&1; then
+        log_warn "rclone sync reported errors — please verify data integrity manually"
+        return 0
+    fi
+
+    log_info "Verifying data integrity..."
+    if rclone check minio:bebop garage:bebop --config "$TMPDIR/rclone.conf" 2>&1; then
+        log_info "Data migration verified — all objects match"
+        run_privileged mkdir -p /etc/garage
+        echo "verified" | run_privileged tee /etc/garage/migration-from-minio.done > /dev/null
+    else
+        log_warn "Data verification found mismatches — migration will retry on next run"
+    fi
+
+}
+
+remove_legacy_minio() {
+    log_info "Removing legacy MinIO..."
+    run_privileged systemctl stop minio 2>/dev/null || true
+    run_privileged systemctl disable minio 2>/dev/null || true
+
+    # Update nginx to proxy S3 traffic to Garage instead of MinIO
+    if [[ -f /etc/nginx/sites-available/be-BOP.conf ]] && \
+       grep -q "proxy_pass http://localhost:9000" /etc/nginx/sites-available/be-BOP.conf 2>/dev/null; then
+        log_info "Updating nginx S3 proxy: MinIO (9000) → Garage (3900)"
+        run_privileged sed -i 's|proxy_pass http://localhost:9000|proxy_pass http://localhost:3900|' /etc/nginx/sites-available/be-BOP.conf
+        run_privileged systemctl reload nginx
+    fi
+
+    # Full removal only after verified migration
+    if ! has_fact "minio_migration_verified"; then
+        log_warn "MinIO data preserved — migration not yet verified"
+        return 0
+    fi
+
+    run_privileged rm -f /etc/systemd/system/minio.service
+    run_privileged rm -rf /etc/systemd/system/minio.service.d
+    run_privileged systemctl daemon-reload
+    run_privileged rm -f /usr/local/bin/minio
+    run_privileged rm -rf /usr/local/minio
+    run_privileged rm -rf /etc/minio
+    run_privileged rm -rf /var/lib/minio
+    run_privileged rm -rf /var/lib/private/minio
+    run_privileged rm -f /etc/garage/migration-from-minio.done
+
+    log_info "MinIO fully removed from system"
 }
 
 write_bebop_configuration() {
@@ -2516,12 +2801,12 @@ write_bebop_configuration() {
     local domain="$(get_fact "specified_domain")"
 
     # Read various secrets to embed into the configuration file.
-    local s3_root_user="$(run_privileged grep '^MINIO_ROOT_USER=' /etc/minio/config.env 2>/dev/null | cut -d'=' -f2- || echo "")"
-    local s3_root_password="$(run_privileged grep '^MINIO_ROOT_PASSWORD=' /etc/minio/config.env 2>/dev/null | cut -d'=' -f2- || echo "")"
+    local s3_root_user="$(run_privileged grep '^GARAGE_KEY_ID=' /etc/garage/credentials.env 2>/dev/null | cut -d'=' -f2- || echo "")"
+    local s3_root_password="$(run_privileged grep '^GARAGE_KEY_SECRET=' /etc/garage/credentials.env 2>/dev/null | cut -d'=' -f2- || echo "")"
     local phoenixd_http_password="$(run_privileged grep -oP 'http-password=\K[^ ]+' /var/lib/phoenixd/.phoenix/phoenix.conf)"
 
     if [[ -z "$s3_root_user" ]] || [[ -z "$s3_root_password" ]]; then
-        die $EXIT_ERROR $LINENO "Could not find MinIO credentials in /etc/minio/config.env"
+        die $EXIT_ERROR $LINENO "Could not find Garage credentials in /etc/garage/credentials.env"
     fi
 
     local TMPDIR=$(mktemp -d)
@@ -2540,10 +2825,10 @@ PUBLIC_S3_ENDPOINT_URL=https://$(get_fact s3_domain)
 PHOENIXD_ENDPOINT_URL=http://127.0.0.1:9740
 PHOENIXD_HTTP_PASSWORD=${phoenixd_http_password}
 S3_BUCKET=bebop
-S3_ENDPOINT_URL=http://127.0.0.1:9000
+S3_ENDPOINT_URL=http://127.0.0.1:3900
 S3_KEY_ID=${s3_root_user}
 S3_KEY_SECRET=${s3_root_password}
-S3_REGION=localhost
+S3_REGION=garage
 XFF_DEPTH=1
 EOF
 
@@ -2622,43 +2907,42 @@ EOF
     rm -rf "$TMPDIR"
 }
 
-install_minio_service() {
-    log_info "Configuring MinIO systemd service..."
+install_garage_service() {
+    log_info "Configuring Garage systemd service..."
 
     local TMPDIR=$(mktemp -d)
     # shellcheck disable=SC2064  # TMPDIR should be expanded here (and not on trap).
     trap "rm -rf $TMPDIR" RETURN 2>/dev/null || true
 
-    # Create MinIO systemd service file (container-compatible)
-    cat > "$TMPDIR/minio.service" << 'EOF'
+    # Create Garage systemd service file (container-compatible)
+    cat > "$TMPDIR/garage.service" << 'EOF'
 [Unit]
-Description=MinIO Object Storage Server
-Documentation=https://min.io/docs/minio/linux/index.html
+Description=Garage S3-compatible Storage Server
+Documentation=https://garagehq.deuxfleurs.fr
 After=network.target
 Wants=network.target
 
 [Service]
-Type=notify
-ExecStartPre=/usr/bin/mkdir -p /var/lib/minio/be-BOP
-ExecStart=/usr/local/bin/minio server /var/lib/minio/be-BOP --console-address :9001
+Type=simple
+ExecStart=/usr/local/bin/garage server
 Restart=always
 RestartSec=5
 TimeoutStartSec=60
 TimeoutStopSec=30
 
 # State directory for persistent data
-StateDirectory=minio
+StateDirectory=garage
 StateDirectoryMode=0755
 
 # Working directory and environment
-WorkingDirectory=/var/lib/minio
-Environment=HOME=/var/lib/minio
-EnvironmentFile=/etc/minio/config.env
+WorkingDirectory=/var/lib/garage
+Environment=HOME=/var/lib/garage
+Environment=GARAGE_CONFIG_FILE=/etc/garage.toml
 
 # Logging
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=minio
+SyslogIdentifier=garage
 
 # Resource limits
 LimitNOFILE=65536
@@ -2667,7 +2951,7 @@ LimitNOFILE=65536
 WantedBy=multi-user.target
 EOF
 
-    install_file "$TMPDIR/minio.service" /etc/systemd/system/minio.service
+    install_file "$TMPDIR/garage.service" /etc/systemd/system/garage.service
     run_privileged systemctl daemon-reload
 
     # Cleanup
@@ -2686,8 +2970,8 @@ install_bebop_service() {
 [Unit]
 Description=be-BOP Application Server
 Documentation=https://github.com/be-BOP/be-BOP
-After=network.target minio.service mongod.service
-Wants=network.target minio.service mongod.service
+After=network.target garage.service mongod.service
+Wants=network.target garage.service mongod.service
 
 [Service]
 Type=simple
@@ -2764,8 +3048,8 @@ EOF
     rm -rf "$TMPDIR"
 }
 
-configure_minio_hardening_overrides() {
-    log_info "Applying security hardening to MinIO service..."
+configure_garage_hardening_overrides() {
+    log_info "Applying security hardening to Garage service..."
 
     local TMPDIR=$(mktemp -d)
     # shellcheck disable=SC2064  # TMPDIR should be expanded here (and not on trap).
@@ -2775,7 +3059,8 @@ configure_minio_hardening_overrides() {
     cat > "$TMPDIR/overrides.conf" << 'EOF'
 [Service]
 # Security hardening (VM/bare metal only)
-DynamicUser=yes
+# Note: DynamicUser is NOT used here because Garage reads /etc/garage.toml
+# which must be root-owned with restricted permissions (640) to protect rpc_secret.
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
@@ -2793,8 +3078,8 @@ SystemCallErrorNumber=EPERM
 EOF
 
     # Create override directory and install configuration
-    run_privileged mkdir -p /etc/systemd/system/minio.service.d
-    install_file "$TMPDIR/overrides.conf" /etc/systemd/system/minio.service.d/overrides.conf
+    run_privileged mkdir -p /etc/systemd/system/garage.service.d
+    install_file "$TMPDIR/overrides.conf" /etc/systemd/system/garage.service.d/overrides.conf
     run_privileged systemctl daemon-reload
 
     # Cleanup
@@ -2850,15 +3135,16 @@ start_and_enable_phoenixd() {
     run_privileged systemctl start phoenixd
 }
 
-start_and_enable_minio() {
-    log_info "Starting and enabling MinIO service..."
-    run_privileged systemctl enable minio
-    run_privileged systemctl start minio
+start_and_enable_garage() {
+    log_info "Starting and enabling Garage service..."
+    run_privileged systemctl daemon-reload
+    run_privileged systemctl enable garage
+    run_privileged systemctl start garage
 }
 
-restart_minio() {
-    log_info "Restarting MinIO service..."
-    run_privileged systemctl restart minio
+restart_garage() {
+    log_info "Restarting Garage service..."
+    run_privileged systemctl restart garage
 }
 
 start_and_enable_bebop() {
