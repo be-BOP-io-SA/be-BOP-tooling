@@ -1,0 +1,56 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 be-bop.io contributors
+#
+# Template unit for a single per-tenant phoenixd Lightning daemon.
+# Instantiate as:  systemctl enable --now phoenixd@<tenant>.service
+#
+# Per-instance prerequisites populated by add-tenant.sh:
+#   /etc/phoenixd/<tenant>/port.env             root:root 0640
+#       Must define PHOENIXD_PORT=<port> (e.g. 9741)
+#
+# State (seed.dat, phoenix.conf with http-password) is auto-created by
+# phoenixd on first start under /var/lib/phoenixd/<tenant>/.phoenix/, owned by
+# the dynamic user. THE SEED IS CRITICAL — back it up encrypted off-host.
+
+[Unit]
+Description=phoenixd Lightning Daemon (%i)
+Documentation=https://phoenix.acinq.co/server/
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=phoenixd/%i
+StateDirectoryMode=0700
+EnvironmentFile=/etc/phoenixd/%i/port.env
+ExecStart=/usr/local/bin/phoenixd \
+    --datadir=/var/lib/phoenixd/%i/.phoenix \
+    --http-bind-ip=127.0.0.1 \
+    --http-bind-port=${PHOENIXD_PORT}
+Restart=always
+RestartSec=5
+TimeoutStartSec=60
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=phoenixd-%i
+
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictNamespaces=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

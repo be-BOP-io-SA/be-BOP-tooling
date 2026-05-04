@@ -1,0 +1,58 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 be-bop.io contributors
+#
+# Template unit for a single be-BOP tenant.
+# Instantiate as:  systemctl enable --now bebop@<tenant>.service
+#
+# Per-instance prerequisites populated by add-tenant.sh:
+#   /var/lib/be-BOP/<tenant>/                   root:root 0755 (created by tooling)
+#   /var/lib/be-BOP/<tenant>/releases/<tag>/    root:root 0755 (release artefact)
+#   /var/lib/be-BOP/<tenant>/releases/current   symlink → <tag>
+#   /etc/be-BOP/<tenant>/config.env             root:root 0640 (per-tenant env)
+#
+# /var/lib/be-BOP/<tenant>/state/ is created on first start by systemd via
+# StateDirectory=, and owned by the dynamic user. This is where pnpm caches
+# and any future runtime data live; the release tree above stays read-only.
+
+[Unit]
+Description=be-BOP Application Server (%i)
+Documentation=https://github.com/be-BOP-io-SA/be-BOP
+After=network.target garage.service
+Wants=network.target garage.service
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=be-BOP/%i/state
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/be-BOP/%i/releases/current
+Environment=HOME=/var/lib/be-BOP/%i/state
+Environment=NODE_ENV=production
+EnvironmentFile=/etc/be-BOP/%i/config.env
+ExecStart=/usr/bin/pnpm run-production
+Restart=always
+RestartSec=5
+TimeoutStartSec=60
+TimeoutStopSec=30
+LimitNOFILE=65536
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=bebop-%i
+
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
