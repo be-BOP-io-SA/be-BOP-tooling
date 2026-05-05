@@ -9,16 +9,22 @@ PoC spec. Run them in order. Each `EXPECT:` line is the pass condition.
 ## Setup
 
 ```bash
-# On a newly provisioned VDS
+# On a newly provisioned VDS — single command, only curl + tar required.
+# TODO: switch to https://be-bop.io/saas/install.sh once configured.
 ssh root@your-contabo-vds
-git clone https://github.com/Tirodem/be-BOP-tooling.git
-cd be-BOP-tooling && git checkout multitenant-poc
+curl -sfSL \
+  https://raw.githubusercontent.com/Tirodem/be-BOP-tooling/multitenant-poc/multitenant-tooling/install.sh \
+  -o install.sh \
+  && sudo bash ./install.sh
 
-# Prepare secrets
-mkdir -p /etc/be-BOP-tooling
-cp multitenant-tooling/templates/secrets.env.example /etc/be-BOP-tooling/secrets.env
-chmod 600 /etc/be-BOP-tooling/secrets.env
-nano /etc/be-BOP-tooling/secrets.env       # fill in OVH, SMTP, Zulip, SFTP, BACKUP_ENCRYPTION_KEY
+# install.sh:
+#   - downloads the multitenant-poc tarball,
+#   - installs the tooling under /opt/be-BOP-tooling/,
+#   - seeds /etc/be-BOP-tooling/secrets.env from the template (mode 0600),
+#   - runs host-bootstrap.sh --defer-secrets (provisions everything that
+#     does not need OVH credentials),
+#   - opens secrets.env in nano so you can fill in OVH, SMTP, Zulip, SFTP,
+#     Mongo cluster info, BACKUP_ENCRYPTION_KEY.
 ```
 
 ---
@@ -26,7 +32,9 @@ nano /etc/be-BOP-tooling/secrets.env       # fill in OVH, SMTP, Zulip, SFTP, BAC
 ## Test 1 — host-bootstrap.sh on a vierge VDS
 
 ```bash
-multitenant-tooling/host-bootstrap.sh --verbose
+# After saving secrets.env, finalise the bootstrap (runs the deferred
+# OVH-credential steps and verifies OVH connectivity):
+sudo /opt/be-BOP-tooling/host-bootstrap.sh --verbose
 ```
 
 EXPECT: exit 0; final summary printed; `garage status` works;

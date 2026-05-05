@@ -5,12 +5,38 @@ multi-tenant be-BOP. Idempotent — safe to re-run.
 
 ## Usage
 
+In normal operation you do **not** call this directly on a fresh host —
+`install.sh` (the one-shot fetcher) runs it for you in `--defer-secrets`
+mode, then you re-run it manually after editing `secrets.env`:
+
+```bash
+# First-time setup (single command).
+# TODO: switch to https://be-bop.io/saas/install.sh once configured.
+curl -sfSL \
+  https://raw.githubusercontent.com/Tirodem/be-BOP-tooling/multitenant-poc/multitenant-tooling/install.sh \
+  -o install.sh \
+  && sudo bash ./install.sh
+
+# After editing secrets.env (idempotent — only finalises OVH steps):
+sudo /opt/be-BOP-tooling/host-bootstrap.sh
+```
+
+Direct invocation (for re-runs, drift fixes, version bumps):
+
 ```bash
 host-bootstrap.sh [options]
 ```
 
-Options: `--secrets-file <path>`, `--non-interactive`, `--dry-run`,
-`--verbose`, `--help`.
+Options:
+- `--secrets-file <path>` — path to secrets.env (default
+  `/etc/be-BOP-tooling/secrets.env`).
+- `--defer-secrets` — skip steps that need OVH credentials (used by
+  `install.sh` on the very first run, before the operator has filled in
+  `secrets.env`). Re-run without this flag to finalise.
+- `--non-interactive` — refuse to prompt; exit if input would be needed.
+- `--dry-run` — print actions without changing the system.
+- `--verbose` — verbose logging.
+- `--help`.
 
 ## What it does
 

@@ -170,33 +170,51 @@ multitenant-tooling/
 ## Quick start
 
 ```bash
-# 1. On a fresh Debian 12 host, as root:
-git clone https://github.com/Tirodem/be-BOP-tooling.git
-cd be-BOP-tooling
-git checkout multitenant-poc
-cp multitenant-tooling/templates/secrets.env.example /etc/be-BOP-tooling/secrets.env
-chmod 600 /etc/be-BOP-tooling/secrets.env
-nano /etc/be-BOP-tooling/secrets.env           # fill in OVH, SMTP, Zulip, SFTP
+# 1. On a fresh Debian 12 host, one command — only curl + tar required
+#    (both shipped in Debian base; no git, no manual download).
+#    TODO: switch to https://be-bop.io/saas/install.sh once configured.
+curl -sfSL \
+  https://raw.githubusercontent.com/Tirodem/be-BOP-tooling/multitenant-poc/multitenant-tooling/install.sh \
+  -o install.sh \
+  && sudo bash ./install.sh
 
-multitenant-tooling/host-bootstrap.sh          # idempotent
+# This installer:
+#   - downloads the multitenant-poc tarball from GitHub,
+#   - installs the tooling to /opt/be-BOP-tooling/,
+#   - seeds /etc/be-BOP-tooling/secrets.env from the template,
+#   - runs host-bootstrap.sh --defer-secrets (everything that does NOT
+#     require OVH credentials: apt packages, Node, Garage, phoenixd,
+#     nginx catch-all, docker, Uptime Kuma, netdata, systemd units…),
+#   - then opens secrets.env in nano so you can fill in OVH / SMTP /
+#     Zulip / SFTP / Mongo cluster details.
 
-# 2. Manual one-time step: open Uptime Kuma in a browser via SSH tunnel,
+# 2. After saving secrets.env, finalise the host bootstrap (this only
+#    runs the deferred OVH-credential steps; safe to re-run anytime):
+sudo /opt/be-BOP-tooling/host-bootstrap.sh
+
+# 3. Manual one-time step: open Uptime Kuma in a browser via SSH tunnel,
 #    create the admin account and configure mail + Zulip notification
 #    channels (host-wide, used by all tenants).
 ssh -L 8810:localhost:8810 your-vds
 # ... open http://localhost:8810 ...
 
-# 3. Onboard your first tenant:
-add-tenant.sh tenant1 --admin-email merchant1@example.com
+# 4. Onboard your first tenant:
+sudo add-tenant.sh tenant1 --admin-email merchant1@example.com
 
-# 4. Operate.
-upgrade-tenant.sh tenant1 --version latest
-remove-tenant.sh tenant1                          # soft-delete (reversible)
-remove-tenant.sh tenant1 --reactivate             # ← oops, restore it
+# 5. Operate.
+sudo upgrade-tenant.sh tenant1 --version latest
+sudo remove-tenant.sh  tenant1                    # soft-delete (reversible)
+sudo remove-tenant.sh  tenant1 --reactivate       # ← oops, restore it
                                                   # (run via add-tenant.sh)
-remove-tenant.sh tenant1 --archive                # encrypted SFTP archive
-remove-tenant.sh tenant1 --purge                  # nuclear (with confirm)
+sudo remove-tenant.sh  tenant1 --archive          # encrypted SFTP archive
+sudo remove-tenant.sh  tenant1 --purge            # nuclear (with confirm)
 ```
+
+> **PoC vs. production URL:** the command above curls `install.sh`
+> straight from `raw.githubusercontent.com` because `be-bop.io` is not
+> wired up yet. The eventual canonical entry point is
+> `https://be-bop.io/saas/install.sh` — the script content does not
+> change, only the host serving it.
 
 ---
 

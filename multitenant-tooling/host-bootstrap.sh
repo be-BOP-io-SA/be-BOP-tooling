@@ -83,6 +83,7 @@ SECRETS_FILE=/etc/be-BOP-tooling/secrets.env
 DRY_RUN=false
 RUN_NON_INTERACTIVE=false
 VERBOSE=false
+DEFER_SECRETS=false
 
 usage() {
     cat <<EOF
@@ -94,6 +95,12 @@ Usage:
 
 Options:
   --secrets-file <path>  Path to secrets.env. Default: ${SECRETS_FILE}
+  --defer-secrets        Run only the steps that do not need secrets.env
+                         (apt packages, binaries, dirs, garage, nginx,
+                         systemd units, registry, docker, kuma, netdata).
+                         Skips OVH connectivity check and certbot OVH
+                         credentials. Re-run host-bootstrap.sh after
+                         editing secrets.env to finalise — it is idempotent.
   --non-interactive      Refuse to prompt; exit if input would be required.
   --dry-run              Print what would happen without changing the system.
   --verbose              Verbose logging (also enables --debug at journald).
@@ -110,6 +117,7 @@ EOF
 while (( $# )); do
     case "$1" in
         --secrets-file)    SECRETS_FILE="$2"; shift 2 ;;
+        --defer-secrets)   DEFER_SECRETS=true; shift ;;
         --non-interactive) RUN_NON_INTERACTIVE=true; shift ;;
         --dry-run)         DRY_RUN=true; shift ;;
         --verbose)         VERBOSE=true; shift ;;
@@ -118,7 +126,7 @@ while (( $# )); do
     esac
 done
 
-export RUN_NON_INTERACTIVE VERBOSE DRY_RUN
+export RUN_NON_INTERACTIVE VERBOSE DRY_RUN DEFER_SECRETS
 
 # Wrapper: do nothing in --dry-run mode but still log.
 maybe_run() {
@@ -171,6 +179,10 @@ step_check_prerequisites() {
 step_load_secrets() {
     log_info "Loading secrets from ${SECRETS_FILE}..."
     if [[ ! -f "$SECRETS_FILE" ]]; then
+        if [[ "$DEFER_SECRETS" == "true" ]]; then
+            log_warn "secrets file not found: ${SECRETS_FILE} — continuing in --defer-secrets mode"
+            return 0
+        fi
         die "secrets file not found: ${SECRETS_FILE} (copy templates/secrets.env.example, fill it, chmod 600, and rerun)"
     fi
     local mode
@@ -186,6 +198,10 @@ step_load_secrets() {
         [[ -z "${!v:-}" ]] && missing+=("$v")
     done
     if (( ${#missing[@]} )); then
+        if [[ "$DEFER_SECRETS" == "true" ]]; then
+            log_warn "secrets.env has empty values: ${missing[*]} — continuing in --defer-secrets mode"
+            return 0
+        fi
         die "secrets.env is missing required values: ${missing[*]}"
     fi
     log_info "secrets loaded ✓"
@@ -193,6 +209,10 @@ step_load_secrets() {
 
 # === OVH connectivity ====================================================
 step_verify_ovh_connectivity() {
+    if [[ "$DEFER_SECRETS" == "true" && -z "${OVH_APPLICATION_KEY:-}" ]]; then
+        log_info "Skipping OVH connectivity check (--defer-secrets)"
+        return 0
+    fi
     log_info "Verifying OVH API connectivity..."
     if ! ovh_ping; then
         die "OVH API ping failed; check OVH_APPLICATION_KEY / OVH_APPLICATION_SECRET / OVH_CONSUMER_KEY in ${SECRETS_FILE}"
@@ -484,6 +504,10 @@ step_start_nginx() {
 
 # === certbot OVH credentials ============================================
 step_install_ovh_credentials_for_certbot() {
+    if [[ "$DEFER_SECRETS" == "true" && -z "${OVH_APPLICATION_KEY:-}" ]]; then
+        log_info "Skipping certbot OVH credentials (--defer-secrets) — re-run after editing secrets.env"
+        return 0
+    fi
     log_info "Installing /etc/letsencrypt/ovh.ini..."
     local tmp
     tmp=$(mktemp)
@@ -580,10 +604,14 @@ step_install_netdata() {
 
 # === Summary ===========================================================
 step_print_summary() {
+    local title="be-BOP multi-tenant host bootstrap COMPLETE"
+    if [[ "$DEFER_SECRETS" == "true" && -z "${OVH_APPLICATION_KEY:-}" ]]; then
+        title="be-BOP multi-tenant host bootstrap PARTIAL (deferred-secrets mode)"
+    fi
     cat <<EOF
 
 ==========================================================================
-  be-BOP multi-tenant host bootstrap COMPLETE
+  ${title}
 ==========================================================================
 
 Versions installed:
@@ -612,6 +640,15 @@ Services running:
   bebop-uptime-kuma (Docker, bound to 127.0.0.1:${UPTIME_KUMA_HOST_PORT})
 
 NEXT STEPS (manual, one-time):
+EOF
+    if [[ "$DEFER_SECRETS" == "true" && -z "${OVH_APPLICATION_KEY:-}" ]]; then
+        cat <<EOF
+  0. Edit ${SECRETS_FILE} (mode 0600), then re-run:
+       sudo ${BEBOP_TOOLING_INSTALL_PREFIX}/host-bootstrap.sh
+     This will install OVH cert credentials and verify connectivity.
+EOF
+    fi
+    cat <<EOF
   1. Set up the Uptime Kuma admin account:
        ssh -L ${UPTIME_KUMA_HOST_PORT}:localhost:${UPTIME_KUMA_HOST_PORT} this-host
        open http://localhost:${UPTIME_KUMA_HOST_PORT} in your browser
