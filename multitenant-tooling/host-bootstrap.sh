@@ -225,7 +225,7 @@ step_install_apt_packages() {
     maybe_run run_privileged env DEBIAN_FRONTEND=noninteractive apt-get update -qq
     local pkgs=(
         ca-certificates curl gpg jq openssl unzip stow xxd
-        flock util-linux
+        util-linux
         rclone
         nginx
         certbot python3-certbot-dns-ovh
