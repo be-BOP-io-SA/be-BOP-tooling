@@ -24,6 +24,11 @@ DynamicUser=yes
 StateDirectory=phoenixd/%i
 StateDirectoryMode=0700
 EnvironmentFile=/etc/phoenixd/%i/port.env
+# HOME is defensive: phoenixd's Kotlin Native runtime calls getpwuid on
+# startup and dereferences fields without null-checks; with DynamicUser
+# the synthesized passwd entry can confuse it. Pointing HOME at the
+# datadir avoids a kotlin.NullPointerException during $init_global.
+Environment=HOME=/var/lib/phoenixd/%i/.phoenix
 ExecStart=/usr/local/bin/phoenixd \
     --datadir=/var/lib/phoenixd/%i/.phoenix \
     --http-bind-ip=127.0.0.1 \
@@ -36,7 +41,9 @@ StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=phoenixd-%i
 
-# Hardening
+# Hardening — note: MemoryDenyWriteExecute=yes is INTENTIONALLY ABSENT.
+# Kotlin Native + dlopen at init can hit RWX pages and crash with
+# kotlin.native.internal.FileFailedToInitializeException.
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
@@ -47,7 +54,6 @@ ProtectControlGroups=yes
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 RestrictSUIDSGID=yes
 LockPersonality=yes
-MemoryDenyWriteExecute=yes
 RestrictNamespaces=yes
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
