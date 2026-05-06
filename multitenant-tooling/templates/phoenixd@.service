@@ -24,13 +24,14 @@ DynamicUser=yes
 StateDirectory=phoenixd/%i
 StateDirectoryMode=0700
 EnvironmentFile=/etc/phoenixd/%i/port.env
-# HOME is defensive: phoenixd's Kotlin Native runtime calls getpwuid on
-# startup and dereferences fields without null-checks; with DynamicUser
-# the synthesized passwd entry can confuse it. Pointing HOME at the
-# datadir avoids a kotlin.NullPointerException during $init_global.
-Environment=HOME=/var/lib/phoenixd/%i/.phoenix
+# phoenixd 0.6.x has no --datadir flag; it reads/writes $HOME/.phoenix/
+# unconditionally. Pointing HOME at the StateDirectory parent makes
+# phoenixd land its state at /var/lib/phoenixd/<i>/.phoenix/ — the path
+# add-tenant.sh polls for phoenix.conf. Setting HOME also avoids a
+# kotlin.NullPointerException at $init_global when DynamicUser leaves
+# the synthesized passwd entry's pw_dir empty.
+Environment=HOME=/var/lib/phoenixd/%i
 ExecStart=/usr/local/bin/phoenixd \
-    --datadir=/var/lib/phoenixd/%i/.phoenix \
     --http-bind-ip=127.0.0.1 \
     --http-bind-port=${PHOENIXD_PORT}
 Restart=always
