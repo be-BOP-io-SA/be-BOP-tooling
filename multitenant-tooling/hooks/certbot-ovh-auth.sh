@@ -20,6 +20,15 @@
 
 set -eEuo pipefail
 
+# Redirect our stderr to stdout so certbot doesn't tag our log_info /
+# log_warn output as "error output" (Hook ... ran with error output).
+# The hook's lib/log.sh writes to stderr by convention; certbot
+# captures both streams and labels stderr as errors, even when the
+# exit code is 0. Merging them keeps the log content intact (still
+# visible in /var/log/letsencrypt/letsencrypt.log and in journald via
+# systemd-cat) without the misleading warning.
+exec 2>&1
+
 : "${SECRETS_FILE:=/etc/be-BOP-tooling/secrets.env}"
 : "${BEBOP_TOOLING_LIB_DIR:=/usr/local/share/be-BOP-tooling/lib}"
 : "${ACME_PROPAGATION_SECONDS:=60}"

@@ -15,6 +15,10 @@
 
 set -eEuo pipefail
 
+# Same as certbot-ovh-auth.sh: keep certbot from labeling our normal
+# log output as "error output".
+exec 2>&1
+
 : "${SECRETS_FILE:=/etc/be-BOP-tooling/secrets.env}"
 : "${BEBOP_TOOLING_LIB_DIR:=/usr/local/share/be-BOP-tooling/lib}"
 

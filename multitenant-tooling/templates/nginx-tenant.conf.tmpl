@@ -43,8 +43,10 @@ server {
     ssl_session_cache shared:SSL-bebop-@tenant_id@:10m;
     ssl_session_tickets off;
     ssl_prefer_server_ciphers off;
-    ssl_stapling on;
-    ssl_stapling_verify on;
+    # OCSP stapling intentionally disabled: Let's Encrypt stopped including
+    # OCSP responder URLs in their certs in 2025; ssl_stapling on; would
+    # log a benign-but-noisy warning per nginx reload. Modern PKI is
+    # moving to CRLite / browser-side checks anyway.
 
     add_header Strict-Transport-Security "max-age=31536000" always;
 
@@ -93,8 +95,10 @@ server {
     ssl_session_cache shared:SSL-bebop-@tenant_id@-s3:10m;
     ssl_session_tickets off;
     ssl_prefer_server_ciphers off;
-    ssl_stapling on;
-    ssl_stapling_verify on;
+    # OCSP stapling intentionally disabled: Let's Encrypt stopped including
+    # OCSP responder URLs in their certs in 2025; ssl_stapling on; would
+    # log a benign-but-noisy warning per nginx reload. Modern PKI is
+    # moving to CRLite / browser-side checks anyway.
 
     add_header Strict-Transport-Security "max-age=31536000" always;
 
