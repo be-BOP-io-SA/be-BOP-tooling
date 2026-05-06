@@ -44,6 +44,8 @@ source "$BEBOP_TOOLING_LIB_DIR/transaction.sh"
 source "$BEBOP_TOOLING_LIB_DIR/registry.sh"
 # shellcheck source=lib/ovh.sh
 source "$BEBOP_TOOLING_LIB_DIR/ovh.sh"
+# shellcheck source=lib/mongo.sh
+source "$BEBOP_TOOLING_LIB_DIR/mongo.sh"
 # shellcheck source=lib/garage.sh
 source "$BEBOP_TOOLING_LIB_DIR/garage.sh"
 # shellcheck source=lib/notify.sh
@@ -156,15 +158,12 @@ ZONE=""                # <zone> from secrets.env
 HOST_IP=""
 BEBOP_PORT=""
 PHOENIXD_PORT=""
+MONGO_PORT=""
 GARAGE_BUCKET=""
 GARAGE_KEY_NAME=""
 GARAGE_KEY_ID=""
 GARAGE_KEY_SECRET=""
 MONGO_DB_NAME=""
-MONGO_USER_NAME=""
-MONGO_PASSWORD=""
-MONGO_DB_ID=""
-MONGO_USER_ID=""
 MONGO_URL=""
 PHOENIXD_HTTP_PASSWORD=""
 PHOENIXD_SEED_HEX=""
@@ -249,16 +248,17 @@ phase_derive_identifiers() {
     GARAGE_BUCKET="bebop-${TENANT_ID}"
     GARAGE_KEY_NAME="bebop-${TENANT_ID}-key"
     MONGO_DB_NAME="bebop_${TENANT_ID//-/_}"
-    MONGO_USER_NAME="bebop_${TENANT_ID//-/_}"
 
     if [[ "${DECISION_PATH:-fresh}" == "fresh" ]]; then
         BEBOP_PORT=$(registry_allocate_port bebop)
         PHOENIXD_PORT=$(registry_allocate_port phoenixd)
+        MONGO_PORT=$(registry_allocate_port mongo)
     else
         BEBOP_PORT=$(registry_get_field "$TENANT_ID" bebop_port)
         PHOENIXD_PORT=$(registry_get_field "$TENANT_ID" phoenixd_port)
+        MONGO_PORT=$(registry_get_field "$TENANT_ID" mongo_port)
     fi
-    log_info "ports: bebop=${BEBOP_PORT}, phoenixd=${PHOENIXD_PORT}"
+    log_info "ports: bebop=${BEBOP_PORT}, phoenixd=${PHOENIXD_PORT}, mongo=${MONGO_PORT}"
     log_info "domain: https://${DOMAIN} (S3: https://${S3_DOMAIN})"
 }
 
@@ -275,19 +275,30 @@ phase_dns() {
     log_info "DNS records pushed; OVH propagates them to authoritative NS within ~30s"
 }
 
-# Phase 4: Managed Mongo provisioning (DB + scoped user)
+# Phase 4: per-tenant local mongod (port.env + start unit + init RS)
 phase_mongo() {
-    log_info "phase 4: OVH Managed Mongo (DB + user)..."
-    MONGO_PASSWORD=$(gen_password)
-    MONGO_DB_ID=$(ovh_mongo_db_create "$MONGO_DB_NAME")
-    txn_register_undo "Mongo DB ${MONGO_DB_NAME}" \
-        "ovh_mongo_db_delete '${MONGO_DB_ID}'"
-    MONGO_USER_ID=$(ovh_mongo_user_create "$MONGO_USER_NAME" "$MONGO_PASSWORD" "$MONGO_DB_ID" readWrite)
-    txn_register_undo "Mongo user ${MONGO_USER_NAME}" \
-        "ovh_mongo_user_delete '${MONGO_USER_ID}'"
-    ovh_mongo_wait_for_user_ready "$MONGO_USER_ID" || die "Mongo user did not become READY"
-    MONGO_URL=$(ovh_mongo_build_url "$MONGO_USER_NAME" "$MONGO_PASSWORD" "$MONGO_DB_NAME")
-    log_info "Mongo: db=${MONGO_DB_NAME} user=${MONGO_USER_NAME} (id=${MONGO_USER_ID})"
+    log_info "phase 4: per-tenant mongod (port=${MONGO_PORT})..."
+    # Write port.env BEFORE starting the unit (EnvironmentFile= reads it).
+    run_privileged install -d -m 0755 "/etc/be-BOP-mongodb/${TENANT_ID}"
+    local tmp
+    tmp=$(mktemp)
+    printf 'MONGO_PORT=%s\n' "$MONGO_PORT" > "$tmp"
+    run_privileged install -m 0640 "$tmp" "/etc/be-BOP-mongodb/${TENANT_ID}/port.env"
+    rm -f "$tmp"
+    txn_register_undo "mongod port.env" \
+        "run_privileged rm -rf '/etc/be-BOP-mongodb/${TENANT_ID}'"
+
+    run_privileged systemctl enable --now "mongod@${TENANT_ID}.service"
+    txn_register_undo "mongod@${TENANT_ID}.service" \
+        "run_privileged systemctl disable --now 'mongod@${TENANT_ID}.service' 2>/dev/null || true; run_privileged rm -rf '/var/lib/be-BOP-mongodb/${TENANT_ID}'"
+
+    if [[ "$DRY_RUN" != "true" ]]; then
+        mongo_wait_ready "$MONGO_PORT" 60 1 \
+            || die "mongod@${TENANT_ID} did not become ready on 127.0.0.1:${MONGO_PORT} within 60s (check 'journalctl -u mongod@${TENANT_ID}')"
+        mongo_init_rs "$MONGO_PORT"
+    fi
+    MONGO_URL=$(mongo_build_url "$MONGO_PORT" "$MONGO_DB_NAME")
+    log_info "Mongo: db=${MONGO_DB_NAME} on 127.0.0.1:${MONGO_PORT} (rs=rs0)"
 }
 
 # Phase 5: Garage bucket + key + grant + quota
@@ -503,7 +514,8 @@ phase_kuma_and_registry() {
         fresh)
             registry_add \
                 "$TENANT_ID" "$DOMAIN" "$BEBOP_PORT" "$PHOENIXD_PORT" \
-                "$MONGO_DB_NAME" "$GARAGE_BUCKET" "$GARAGE_KEY_NAME" \
+                "$MONGO_PORT" "$MONGO_DB_NAME" \
+                "$GARAGE_BUCKET" "$GARAGE_KEY_NAME" \
                 "$RESOLVED_VERSION" "$now" "active"
             ;;
         reactivate)
@@ -529,13 +541,15 @@ phase_summary() {
   be-BOP version:         ${RESOLVED_VERSION:-unchanged}
   bebop port (local):     ${BEBOP_PORT}
   phoenixd port (local):  ${PHOENIXD_PORT}
+  mongod port (local):    ${MONGO_PORT}
 
   Per-tenant config:      /etc/be-BOP/${TENANT_ID}/config.env
   Per-tenant releases:    /var/lib/be-BOP/${TENANT_ID}/releases/
   Phoenixd state:         /var/lib/phoenixd/${TENANT_ID}/.phoenix/
+  Mongo state:            /var/lib/be-BOP-mongodb/${TENANT_ID}/
 
-  systemd units:          systemctl status bebop@${TENANT_ID} phoenixd@${TENANT_ID}
-  logs:                   journalctl -u bebop@${TENANT_ID} -u phoenixd@${TENANT_ID}
+  systemd units:          systemctl status bebop@${TENANT_ID} phoenixd@${TENANT_ID} mongod@${TENANT_ID}
+  logs:                   journalctl -u bebop@${TENANT_ID} -u phoenixd@${TENANT_ID} -u mongod@${TENANT_ID}
 
 EOF
     if [[ "${DECISION_PATH:-fresh}" == "fresh" && "$ENABLE_PHOENIXD" == "true" ]]; then
@@ -585,9 +599,16 @@ run_reactivation() {
     trap 'on_error_rollback' ERR
     detect_host_ip
     phase_derive_identifiers   # ports re-read from registry
-    # Skipped on reactivation: phase_mongo, phase_garage, phase_directories,
+    # Skipped on reactivation: phase_garage, phase_directories,
     # phase_release, phase_phoenixd (services, port.env, seeds intact).
     phase_dns
+    # Restart the per-tenant mongod (it was stopped during soft-delete; data
+    # in /var/lib/be-BOP-mongodb/<tenant> is intact).
+    run_privileged systemctl enable --now "mongod@${TENANT_ID}.service"
+    if [[ "$DRY_RUN" != "true" ]]; then
+        mongo_wait_ready "$MONGO_PORT" 60 1 \
+            || die "mongod@${TENANT_ID} did not become ready on reactivation"
+    fi
     # Re-read existing phoenixd password from disk (no recreation).
     if [[ "$ENABLE_PHOENIXD" == "true" ]]; then
         local conf="/var/lib/phoenixd/${TENANT_ID}/.phoenix/phoenix.conf"
@@ -595,16 +616,12 @@ run_reactivation() {
             PHOENIXD_HTTP_PASSWORD=$(run_privileged grep -oP '^http-password=\K\S+' "$conf" 2>/dev/null || true)
         fi
     fi
+    # Rebuild the local MONGO_URL from registry-stored port + db name.
+    MONGO_URL=$(mongo_build_url "$MONGO_PORT" "$MONGO_DB_NAME")
     # Pull existing Garage creds (we don't recreate the key; secret is unknown).
-    # On reactivation we leave config.env mostly alone, only fix up domain/port/etc.
-    # If config.env is intact this is a no-op effectively.
-    if [[ -z "$MONGO_URL" ]]; then
-        # We don't re-derive Mongo creds on reactivate; rely on existing config.env.
-        if run_privileged test -f "/etc/be-BOP/${TENANT_ID}/config.env"; then
-            MONGO_URL=$(run_privileged grep -oP '^MONGODB_URL=\K.*' "/etc/be-BOP/${TENANT_ID}/config.env" 2>/dev/null || true)
-            GARAGE_KEY_ID=$(run_privileged grep -oP '^S3_KEY_ID=\K.*' "/etc/be-BOP/${TENANT_ID}/config.env" 2>/dev/null || true)
-            GARAGE_KEY_SECRET=$(run_privileged grep -oP '^S3_KEY_SECRET=\K.*' "/etc/be-BOP/${TENANT_ID}/config.env" 2>/dev/null || true)
-        fi
+    if run_privileged test -f "/etc/be-BOP/${TENANT_ID}/config.env"; then
+        GARAGE_KEY_ID=$(run_privileged grep -oP '^S3_KEY_ID=\K.*' "/etc/be-BOP/${TENANT_ID}/config.env" 2>/dev/null || true)
+        GARAGE_KEY_SECRET=$(run_privileged grep -oP '^S3_KEY_SECRET=\K.*' "/etc/be-BOP/${TENANT_ID}/config.env" 2>/dev/null || true)
     fi
     phase_config_env       # rewrites with current vars (preserves >8 customisations)
     phase_certificate      # idempotent: skip if cert dir exists
@@ -628,9 +645,10 @@ run_reapply() {
     # Idempotent: no rollback needed (we only rewrite config + reload).
     detect_host_ip
     phase_derive_identifiers
-    # Re-derive existing Mongo URL + Garage creds from current config.env.
+    # Rebuild the local MONGO_URL deterministically from registry data.
+    MONGO_URL=$(mongo_build_url "$MONGO_PORT" "$MONGO_DB_NAME")
+    # Re-derive existing Garage creds + phoenixd password from current config.env.
     if run_privileged test -f "/etc/be-BOP/${TENANT_ID}/config.env"; then
-        MONGO_URL=$(run_privileged grep -oP '^MONGODB_URL=\K.*' "/etc/be-BOP/${TENANT_ID}/config.env" 2>/dev/null || true)
         GARAGE_KEY_ID=$(run_privileged grep -oP '^S3_KEY_ID=\K.*' "/etc/be-BOP/${TENANT_ID}/config.env" 2>/dev/null || true)
         GARAGE_KEY_SECRET=$(run_privileged grep -oP '^S3_KEY_SECRET=\K.*' "/etc/be-BOP/${TENANT_ID}/config.env" 2>/dev/null || true)
         PHOENIXD_HTTP_PASSWORD=$(run_privileged grep -oP '^PHOENIXD_HTTP_PASSWORD=\K.*' "/etc/be-BOP/${TENANT_ID}/config.env" 2>/dev/null || true)

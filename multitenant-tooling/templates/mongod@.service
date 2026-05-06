@@ -1,0 +1,62 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 be-bop.io contributors
+#
+# Template unit for a single per-tenant local mongod instance.
+# Instantiate as:  systemctl enable --now mongod@<tenant>.service
+#
+# Per-instance prerequisites populated by add-tenant.sh:
+#   /etc/be-BOP-mongodb/<tenant>/port.env   root:root 0640
+#       Must define MONGO_PORT=<port> (e.g. 27018, 27019, …)
+#
+# State (WiredTiger files, journal, replica set metadata) is auto-created by
+# mongod on first start under /var/lib/be-BOP-mongodb/<tenant>/, owned by the
+# DynamicUser. Each instance is a single-node replica set named rs0; auth is
+# DISABLED because cross-tenant isolation comes from process + filesystem
+# boundaries (DynamicUser + StateDirectory), not from in-DB users.
+
+[Unit]
+Description=MongoDB Database Server (%i)
+Documentation=https://docs.mongodb.com/manual/
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=be-BOP-mongodb/%i
+StateDirectoryMode=0700
+EnvironmentFile=/etc/be-BOP-mongodb/%i/port.env
+ExecStart=/usr/bin/mongod \
+    --dbpath /var/lib/be-BOP-mongodb/%i \
+    --bind_ip 127.0.0.1 \
+    --port ${MONGO_PORT} \
+    --replSet rs0 \
+    --logpath /var/lib/be-BOP-mongodb/%i/mongod.log \
+    --logappend
+Restart=always
+RestartSec=5
+TimeoutStartSec=120
+TimeoutStopSec=60
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mongod-%i
+
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictNamespaces=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

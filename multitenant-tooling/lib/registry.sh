@@ -3,12 +3,13 @@
 #
 # registry.sh — manage /var/lib/be-BOP/tenants.tsv (tab-separated tenant registry).
 #
-# Schema (header row, 10 columns):
+# Schema (header row, 11 columns):
 #   tenant_id       — slug, [a-z0-9][a-z0-9-]*, max 32 chars
 #   domain          — full FQDN, e.g. tenant1.pvh-labs.com
 #   bebop_port      — local port for be-BOP HTTP (≥ 3001)
 #   phoenixd_port   — local port for phoenixd HTTP API (≥ 9741)
-#   mongodb_database — DB name on OVH Managed Mongo, e.g. bebop_tenant1
+#   mongo_port      — local port for the per-tenant mongod (≥ 27018)
+#   mongodb_database — DB name on the per-tenant mongod, e.g. bebop_tenant1
 #   garage_bucket   — bucket name, e.g. bebop-tenant1
 #   garage_key      — Garage access key name, e.g. bebop-tenant1-key
 #   bebop_version   — installed release tag (or empty until first install completes)
@@ -37,8 +38,9 @@ readonly _BEBOP_REGISTRY_SOURCED=1
 : "${REGISTRY_LOCK_PATH:=/var/lib/be-BOP/.tenants.tsv.lock}"
 : "${REGISTRY_BEBOP_PORT_MIN:=3001}"
 : "${REGISTRY_PHOENIXD_PORT_MIN:=9741}"
+: "${REGISTRY_MONGO_PORT_MIN:=27018}"
 
-readonly REGISTRY_HEADER=$'tenant_id\tdomain\tbebop_port\tphoenixd_port\tmongodb_database\tgarage_bucket\tgarage_key\tbebop_version\tcreated_at\tstatus'
+readonly REGISTRY_HEADER=$'tenant_id\tdomain\tbebop_port\tphoenixd_port\tmongo_port\tmongodb_database\tgarage_bucket\tgarage_key\tbebop_version\tcreated_at\tstatus'
 
 _registry_col_index() {
     case "$1" in
@@ -46,12 +48,13 @@ _registry_col_index() {
         domain)            echo 2 ;;
         bebop_port)        echo 3 ;;
         phoenixd_port)     echo 4 ;;
-        mongodb_database)  echo 5 ;;
-        garage_bucket)     echo 6 ;;
-        garage_key)        echo 7 ;;
-        bebop_version)     echo 8 ;;
-        created_at)        echo 9 ;;
-        status)            echo 10 ;;
+        mongo_port)        echo 5 ;;
+        mongodb_database)  echo 6 ;;
+        garage_bucket)     echo 7 ;;
+        garage_key)        echo 8 ;;
+        bebop_version)     echo 9 ;;
+        created_at)        echo 10 ;;
+        status)            echo 11 ;;
         *) die "registry: unknown field '$1'" ;;
     esac
 }
@@ -117,26 +120,27 @@ registry_get_status() {
 # Print all tenant_ids in the registry that match <status> (default: active).
 registry_list_by_status() {
     local status="${1:-active}"
-    awk -F'\t' -v s="$status" 'NR>1 && $10==s { print $1 }' "$REGISTRY_PATH"
+    awk -F'\t' -v s="$status" 'NR>1 && $11==s { print $1 }' "$REGISTRY_PATH"
 }
 
 # Allocate the smallest free port ≥ minimum, skipping ports reserved by tenants
 # in states that hold their port (active, soft-deleted). Archived tenants
 # release their ports.
-# Args: kind = bebop | phoenixd
+# Args: kind = bebop | phoenixd | mongo
 registry_allocate_port() {
     local kind="$1" col min_port
     case "$kind" in
         bebop)    col=3; min_port="$REGISTRY_BEBOP_PORT_MIN" ;;
         phoenixd) col=4; min_port="$REGISTRY_PHOENIXD_PORT_MIN" ;;
-        *) die "registry_allocate_port: unknown kind '$kind' (expected bebop|phoenixd)" ;;
+        mongo)    col=5; min_port="$REGISTRY_MONGO_PORT_MIN" ;;
+        *) die "registry_allocate_port: unknown kind '$kind' (expected bebop|phoenixd|mongo)" ;;
     esac
     local -A used=()
     local port
     while IFS= read -r port; do
         [[ -n "$port" ]] && used["$port"]=1
     done < <(awk -F'\t' -v c="$col" \
-        'NR>1 && ($10=="active" || $10=="soft-deleted") { print $c }' \
+        'NR>1 && ($11=="active" || $11=="soft-deleted") { print $c }' \
         "$REGISTRY_PATH")
     local p="$min_port"
     while [[ -n "${used[$p]:-}" ]]; do
@@ -146,13 +150,13 @@ registry_allocate_port() {
 }
 
 # Append a new row. Caller must hold the lock.
-# Args (10): tenant_id domain bebop_port phoenixd_port mongodb_database
+# Args (11): tenant_id domain bebop_port phoenixd_port mongo_port mongodb_database
 #            garage_bucket garage_key bebop_version created_at status
 registry_add() {
-    if (( $# != 10 )); then
-        die "registry_add: expected 10 args, got $#"
+    if (( $# != 11 )); then
+        die "registry_add: expected 11 args, got $#"
     fi
-    local tenant_id="$1" status="${10}"
+    local tenant_id="$1" status="${11}"
     local row
     row="$(IFS=$'\t'; echo "$*")"
     printf '%s\n' "$row" | run_privileged tee -a "$REGISTRY_PATH" >/dev/null

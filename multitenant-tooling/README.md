@@ -1,9 +1,9 @@
 # be-BOP multi-tenant tooling
 
 Operational tooling to host **10+ isolated be-BOP tenants** on a single
-Debian 12 VDS, with MongoDB externalised to OVH Managed Mongo, a single
-mutualised Garage S3 instance, per-tenant phoenixd Lightning daemons, and
-per-tenant TLS via Let's Encrypt DNS-01 over the OVH API.
+Debian 12 VDS, with one local mongod per tenant, a single mutualised
+Garage S3 instance, per-tenant phoenixd Lightning daemons, and per-tenant
+TLS via Let's Encrypt DNS-01 over the OVH API.
 
 This is a fork of [be-BOP-tooling](https://github.com/be-BOP-io-SA/be-BOP-tooling)
 maintained on the `multitenant-poc` branch. It lives in a sibling directory
@@ -20,22 +20,24 @@ working untouched and upstream merges remain trivial.
 ## Mental model
 
 ```
-                   ┌────────────────────────────────────────┐
-   internet ─►─► nginx ──┐                                  │
-   :443                  │                                  │
-                         ├─►  bebop@tenant1   :3001  ───┐   │   ┌──────────────────┐
-                         ├─►  bebop@tenant2   :3002  ───┤   │   │  OVH Managed     │
-                         ├─►  bebop@tenantN   :30xx  ───┼───┼──►│  MongoDB cluster │
-                         │                              │   │   │  (one cluster,   │
-                         │   phoenixd@tenant1  :9741    │   │   │   one DB per     │
-                         │   phoenixd@tenant2  :9742    │   │   │   tenant)        │
-                         │   phoenixd@tenantN  :97xx    │   │   └──────────────────┘
-                         │                              │   │
-                         └─►  Garage S3        :3900  ──┘   │
-                             (single instance,                │
-                              N buckets, N keys)              │
-                                                              │
-                                  Single VDS Contabo  ────────┘
+   internet ─►─► nginx :443
+                   │
+                   ├─►  bebop@tenant1     :3001
+                   ├─►  bebop@tenant2     :3002
+                   ├─►  bebop@tenantN     :30xx
+                   │
+                   │   phoenixd@tenant1   :9741
+                   │   phoenixd@tenant2   :9742
+                   │   phoenixd@tenantN   :97xx
+                   │
+                   │   mongod@tenant1     :27018  (1 DB, single-node rs0)
+                   │   mongod@tenant2     :27019
+                   │   mongod@tenantN     :270xx
+                   │
+                   └─►  Garage S3         :3900   (single instance, N buckets/keys)
+
+   All bound to 127.0.0.1; nginx is the only public face.
+   Single VDS Contabo, fully self-hosted (no external DBaaS).
 ```
 
 Per tenant on the host:
@@ -44,14 +46,16 @@ Per tenant on the host:
 |---------------------------------------------------------|------------------------|
 | `bebop@<tenant>.service`                                | DynamicUser (systemd)  |
 | `phoenixd@<tenant>.service`                             | DynamicUser (systemd)  |
+| `mongod@<tenant>.service`                               | DynamicUser (systemd)  |
 | `/var/lib/be-BOP/<tenant>/releases/<tag>/`              | root:root 0755         |
 | `/var/lib/be-BOP/<tenant>/state/`                       | dynamic-user 0700      |
 | `/etc/be-BOP/<tenant>/config.env`                       | root:root 0640         |
 | `/var/lib/phoenixd/<tenant>/.phoenix/seed.dat` ⚠       | dynamic-user 0700      |
 | `/etc/phoenixd/<tenant>/port.env`                       | root:root 0640         |
+| `/var/lib/be-BOP-mongodb/<tenant>/` (mongod dbPath)     | dynamic-user 0700      |
+| `/etc/be-BOP-mongodb/<tenant>/port.env`                 | root:root 0640         |
 | `/etc/nginx/sites-available/bebop-<tenant>.conf`        | root:root 0644         |
 | `/etc/letsencrypt/live/bebop-<tenant>/`                 | root:root              |
-| Mongo DB `bebop_<tenant>` + user (OVH-side)             | OVH Managed            |
 | Garage bucket `bebop-<tenant>` + key                    | Garage internal        |
 
 The truth source for who-is-who is the **registry**:
@@ -59,8 +63,8 @@ The truth source for who-is-who is the **registry**:
 concurrent-safe mutations).
 
 ```
-tenant_id   domain                    bebop_port  phoenixd_port  mongodb_database  garage_bucket  garage_key            bebop_version                              created_at             status
-tenant1     tenant1.pvh-labs.com      3001        9741           bebop_tenant1     bebop-tenant1  bebop-tenant1-key     be-BOP.release.2026-04-15.abc1234          2026-05-04T14:30:00Z   active
+tenant_id   domain                bebop_port  phoenixd_port  mongo_port  mongodb_database  garage_bucket  garage_key            bebop_version                       created_at             status
+tenant1     tenant1.pvh-labs.com  3001        9741           27018       bebop_tenant1     bebop-tenant1  bebop-tenant1-key     be-BOP.release.2026-04-15.abc1234   2026-05-04T14:30:00Z   active
 ```
 
 **Status values:** `active` (running, ports reserved), `soft-deleted`
@@ -112,13 +116,33 @@ The literal spec used `garage bucket allow --max-size 20G`, but
 are set via `garage bucket set-quotas --max-size 20GiB <bucket>`.
 Verified against `src/garage/cli/structs.rs` on the `main-v2` branch.
 
-### MongoDB externalised to OVH Managed (no local Mongo)
+### One mongod per tenant (local), not a shared cluster
 
-The v1 wizard installed MongoDB locally. The multi-tenant version uses
-OVH Managed Mongo (one cluster, one DB per tenant) so we don't have to
-run a database on the host. This trades self-hosting purity for fewer
-moving parts. The downside: `add-tenant.sh` and `remove-tenant.sh`
-depend on the OVH API being available.
+We deploy one local `mongod` per tenant via the `mongod@<tenant>.service`
+template — each instance bound to `127.0.0.1` on a unique port (≥ 27018),
+each with its own dbPath under `/var/lib/be-BOP-mongodb/<tenant>/`, each
+running as a single-node replica set named `rs0`.
+
+We considered three alternatives and rejected them all:
+- **OVH Managed MongoDB** — the entry-level "Production" tier (3 nodes,
+  smallest instance, 80 GB minimum storage) is around 250 €/mois HT for
+  a PoC, and OVH does not offer a Discovery tier on Mongo. Killer cost.
+- **MongoDB Atlas free tier (M0)** — 512 MB total per cluster, 25 clusters
+  max per org. Workable but tight for real merchant data, and the API
+  surface differs significantly from a local mongod.
+- **Single shared local mongod, one DB per tenant** — denser in RAM but
+  forces us to enable mongod auth as the only multi-tenant boundary;
+  any auth misconfig leaks data across merchants. Per-tenant instances
+  give us free isolation via `DynamicUser=yes` + `StateDirectory=`.
+
+Trade-offs of the chosen approach:
+- 10 mongod instances ≈ ~1.5–3 GB RAM total (idle) on top of be-BOP +
+  phoenixd. Works comfortably on an 8 GB VDS for 10–20 tenants.
+- Crash blast radius is per-tenant (one tenant down ≠ all tenants down).
+- Backups: `mongodump --port <tenant_port> --db <db>` per tenant; embedded
+  in `remove-tenant.sh --archive`.
+- Auth disabled: cross-tenant isolation comes from process + filesystem
+  boundaries, not in-DB users.
 
 ### Idempotence first; rollback for fresh creation only
 
@@ -146,7 +170,8 @@ multitenant-tooling/
 │   ├── sudo.sh                     run_privileged + require_privileges
 │   ├── transaction.sh              undo stack for transactional scripts
 │   ├── registry.sh                 tenants.tsv read/write/lock/allocate-port
-│   ├── ovh.sh                      OVH API: signing, DNS, Managed Mongo
+│   ├── ovh.sh                      OVH API: signing, DNS (DNS-01 + record CRUD)
+│   ├── mongo.sh                    per-tenant mongod helpers (mongosh wrappers)
 │   ├── garage.sh                   bucket/key/quota wrappers
 │   ├── notify.sh                   SMTP + Zulip operator alerts
 │   ├── uptime-kuma.sh              monitor register/unregister (manual stub)
@@ -155,6 +180,7 @@ multitenant-tooling/
 ├── templates/
 │   ├── bebop@.service              systemd template unit (per tenant)
 │   ├── phoenixd@.service           systemd template unit (per tenant)
+│   ├── mongod@.service             systemd template unit (per tenant)
 │   ├── nginx-tenant.conf.tmpl      per-tenant vhost (HTTPS + s3 vhost)
 │   ├── config.env.tmpl             per-tenant be-BOP env file
 │   └── secrets.env.example         shared secrets template
@@ -252,9 +278,8 @@ will detect the partial state and try to reconcile, OR finish with a clear
    tar -tf bebop-archive-tenantX.tar.gz                  # inspect
    ```
 3. The archive contains `metadata.json` (tenant_id, version, ports, db/bucket
-   names) plus `etc-be-BOP/`, `var-lib-phoenixd/` (seed!), and `bucket/`
-   (Garage objects). It does **not** contain a Mongo dump — pull that from
-   OVH's daily provider-side backups.
+   names) plus `etc-be-BOP/`, `var-lib-phoenixd/` (seed!), `bucket/` (Garage
+   objects), and `mongo-dump/` (a `mongodump` of the per-tenant DB).
 4. To revive on the same or a fresh host: re-add the tenant, then restore
    files into the new layout. There is no automated `restore-tenant.sh` yet
    (see [Roadmap](#roadmap)).
@@ -283,18 +308,14 @@ Leave this for v2.
   UI. When Kuma 2.x ships a stable monitor REST API, replace
   `lib/uptime-kuma.sh`'s stubs with real calls — function signatures
   are kept compatible.
-- **Archives don't include a Mongo dump.** OVH Managed Mongo runs daily
-  provider-side backups; we link to those in the archive metadata
-  rather than duplicating the dump. If you need point-in-time recovery
-  inside an archive, add a `mongodump` step gated on the
-  `mongodb-database-tools` package being installed.
 - **No multi-VDS yet.** Cross-host failover, rebalancing, or live
   migration is out of scope. The PoC targets a single Contabo VDS.
 - **`migrate-tenant.sh` not yet implemented.** Importing an existing
   single-host be-BOP into the multi-tenant layout is a v2 deliverable.
-- **No automated mongodump / Garage snapshots.** Backups are the
-  operator's responsibility today (relying on OVH for Mongo and
-  documenting how to use rclone for Garage).
+- **No periodic backups out of the box.** `remove-tenant.sh --archive`
+  produces an encrypted bundle on demand (with mongodump + Garage sync
+  + phoenixd state); periodic snapshots are still the operator's
+  responsibility (cron + rclone + mongodump).
 
 ---
 

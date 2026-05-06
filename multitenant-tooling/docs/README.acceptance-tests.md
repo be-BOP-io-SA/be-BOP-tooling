@@ -24,7 +24,7 @@ curl -sfSL \
 #   - runs host-bootstrap.sh --defer-secrets (provisions everything that
 #     does not need OVH credentials),
 #   - opens secrets.env in nano so you can fill in OVH, SMTP, Zulip, SFTP,
-#     Mongo cluster info, BACKUP_ENCRYPTION_KEY.
+#     BACKUP_ENCRYPTION_KEY.
 ```
 
 ---
@@ -84,12 +84,14 @@ EXPECT: all 10 tenants reach `active` in
 ```bash
 systemctl list-units 'bebop@*.service' --no-legend --no-pager
 systemctl list-units 'phoenixd@*.service' --no-legend --no-pager
-ps -eo pid,user,cmd | grep -E 'pnpm run-production|phoenixd' | grep -v grep | wc -l    # ≥ 20
-ss -tlnp | awk '$4 ~ /127.0.0.1:(30[0-9]+|97[0-9]+)$/ {print $4}' | sort
+systemctl list-units 'mongod@*.service' --no-legend --no-pager
+ps -eo pid,user,cmd | grep -E 'pnpm run-production|phoenixd|mongod' | grep -v grep | wc -l    # ≥ 30
+ss -tlnp | awk '$4 ~ /127.0.0.1:(30[0-9]+|97[0-9]+|2(70[0-9][0-9]|71[0-9][0-9]))$/ {print $4}' | sort
 ```
 
-EXPECT: 10 entries each from systemd; ≥ 20 processes; 10 distinct bebop
-ports + 10 distinct phoenixd ports, all bound to 127.0.0.1.
+EXPECT: 10 entries each from systemd (bebop, phoenixd, mongod); ≥ 30
+processes; 10 distinct bebop, phoenixd, AND mongo ports, all bound to
+127.0.0.1.
 
 Each unit runs under a unique transient UID (DynamicUser). Verify:
 
@@ -103,13 +105,14 @@ done | sort -u | wc -l    # 10 distinct (or all blank if systemd shows runtime U
 ## Test 5 — no collisions
 
 ```bash
-# Distinct ports
+# Distinct ports (bebop=col3, phoenixd=col4, mongo=col5)
 awk -F'\t' 'NR>1 {print $3}' /var/lib/be-BOP/tenants.tsv | sort -u | wc -l    # 10
 awk -F'\t' 'NR>1 {print $4}' /var/lib/be-BOP/tenants.tsv | sort -u | wc -l    # 10
-
-# Distinct Mongo dbs / Garage buckets / cert names
 awk -F'\t' 'NR>1 {print $5}' /var/lib/be-BOP/tenants.tsv | sort -u | wc -l    # 10
+
+# Distinct Mongo dbs (col6) / Garage buckets (col7) / cert names
 awk -F'\t' 'NR>1 {print $6}' /var/lib/be-BOP/tenants.tsv | sort -u | wc -l    # 10
+awk -F'\t' 'NR>1 {print $7}' /var/lib/be-BOP/tenants.tsv | sort -u | wc -l    # 10
 ls /etc/letsencrypt/live | grep -c '^bebop-'                                  # 10
 garage bucket list | grep -c '^bebop-'                                        # 10
 ```
@@ -121,24 +124,26 @@ EXPECT: `10` for every count.
 ```bash
 remove-tenant.sh tenant5 --verbose
 curl -sI https://tenant5.pvh-labs.com/ --max-time 5 | head -1   # 444 / connection failure / nxdomain
-systemctl is-active bebop@tenant5                                # inactive
+systemctl is-active bebop@tenant5 phoenixd@tenant5 mongod@tenant5  # inactive inactive inactive
 ls /var/lib/be-BOP/tenant5/releases/                              # release tree intact
 ls /var/lib/phoenixd/tenant5/.phoenix/seed.dat                    # seed intact
-awk -F'\t' '$1=="tenant5" {print $10}' /var/lib/be-BOP/tenants.tsv  # soft-deleted
+ls /var/lib/be-BOP-mongodb/tenant5/                               # mongod dbPath intact
+awk -F'\t' '$1=="tenant5" {print $11}' /var/lib/be-BOP/tenants.tsv  # soft-deleted
 ```
 
-EXPECT: tenant5 inactive; data on disk; status `soft-deleted` in registry.
+EXPECT: tenant5 inactive (all 3 units); data on disk (releases, seed,
+mongod dbPath); status `soft-deleted` in registry.
 
 ## Test 7 — reactivate tenant5
 
 ```bash
 add-tenant.sh tenant5 --admin-email test5@pvh-labs.com --reactivate --verbose
 curl -sI https://tenant5.pvh-labs.com/ | head -1                 # HTTP/2 200
-awk -F'\t' '$1=="tenant5" {print $10}' /var/lib/be-BOP/tenants.tsv    # active
+awk -F'\t' '$1=="tenant5" {print $11}' /var/lib/be-BOP/tenants.tsv    # active
 ```
 
 EXPECT: tenant5 back online with the SAME ports, SAME bucket, SAME seed
-(no rotation), same Mongo data.
+(no rotation), same Mongo data on the preserved dbPath.
 
 ## Test 8 — upgrade-tenant.sh without perceptible downtime
 
@@ -187,7 +192,8 @@ EXPECT (within ~2 min):
   could short-circuit; either way the operator gets a notification —
   if not via the trap, they will notice via the half-state).
 - DNS records for `tenant11` and `s3.tenant11` are gone (or never created).
-- Mongo DB `bebop_tenant11` is gone (or never created).
+- `mongod@tenant11.service` disabled, `/var/lib/be-BOP-mongodb/tenant11/`
+  removed (or never created).
 - Garage bucket `bebop-tenant11` is gone (or never created).
 - No row for `tenant11` in `tenants.tsv` (since the row write is the LAST
   step before commit).
@@ -216,4 +222,5 @@ left in place.
   `README.remove-tenant.md`).
 - Cross-version migrations of be-BOP that change the config schema.
 - Performance benchmarks under merchant load.
-- Failure modes of OVH itself (Mongo cluster down, DNS API throttling).
+- Failure modes of OVH DNS API (throttling, outage).
+- VDS-level failure scenarios (disk full impacting all per-tenant mongods at once).

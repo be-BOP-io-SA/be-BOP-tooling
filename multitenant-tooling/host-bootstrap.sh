@@ -13,28 +13,32 @@
 #   - Issue any TLS certificate. (Per-tenant SAN certs are issued by add-tenant.sh
 #     via DNS-01 OVH; the only cert-related thing here is installing the
 #     certbot OVH plugin and the credentials file.)
-#   - Install MongoDB locally. (Tenants use OVH Managed Mongo — see secrets.env.)
+#   - Start any mongod. The default mongod.service shipped by mongodb-org is
+#     masked; per-tenant mongod@<tenant>.service instances are started by
+#     add-tenant.sh.
 #
 # What this script DOES, in order:
-#   1.  Validates the host (Debian 12, RAM, disk).
+#   1.  Validates the host (Debian 12, RAM, disk, AVX support).
 #   2.  Loads /etc/be-BOP-tooling/secrets.env.
 #   3.  Verifies OVH API credentials work (calls /me).
-#   4.  Installs apt packages: nodejs, pnpm, certbot+dns-ovh, nginx, docker,
-#       netdata, plus the build/runtime deps (curl, jq, stow, openssl, unzip).
+#   4.  Installs apt packages: nodejs, pnpm, mongodb-org + mongodb-mongosh +
+#       mongodb-database-tools, certbot+dns-ovh, nginx, docker, netdata, plus
+#       the build/runtime deps (curl, jq, stow, openssl, unzip).
 #   5.  Downloads & stows Garage and phoenixd binaries.
 #   6.  Creates the /var/lib/be-BOP/, /etc/be-BOP/, /etc/be-BOP-tooling/,
-#       /etc/phoenixd/ directory skeleton.
+#       /etc/phoenixd/, /etc/be-BOP-mongodb/, /var/lib/be-BOP-mongodb/ skeleton.
 #   7.  Creates the be-bop-cli system user (parity with v1 wizard, used by
 #       upgrade-tenant.sh for systemctl restart privileges).
-#   8.  Writes /etc/garage.toml + garage.service, starts Garage, applies layout.
-#   9.  Writes a 444 catch-all default vhost for nginx, then enables nginx.
-#  10.  Installs /etc/letsencrypt/ovh.ini (mode 0600) for certbot DNS-01.
-#  11.  Installs the systemd template units bebop@.service and phoenixd@.service.
-#  12.  Installs tooling libs (/usr/local/share/be-BOP-tooling/lib/) and the
+#   8.  Masks the default mongod.service (we use per-tenant template instances).
+#   9.  Writes /etc/garage.toml + garage.service, starts Garage, applies layout.
+#  10.  Writes a 444 catch-all default vhost for nginx, then enables nginx.
+#  11.  Installs /etc/letsencrypt/ovh.ini (mode 0600) for certbot DNS-01.
+#  12.  Installs systemd template units bebop@, phoenixd@, mongod@.
+#  13.  Installs tooling libs (/usr/local/share/be-BOP-tooling/lib/) and the
 #       per-tenant scripts ({add,remove,upgrade}-tenant.sh, upgrade-all.sh).
-#  13.  Initialises the empty /var/lib/be-BOP/tenants.tsv registry.
-#  14.  Installs Uptime Kuma (Docker, bound to 127.0.0.1:8810) and Netdata.
-#  15.  Prints a summary including the next operator step (Uptime Kuma admin
+#  14.  Initialises the empty /var/lib/be-BOP/tenants.tsv registry.
+#  15.  Installs Uptime Kuma (Docker, bound to 127.0.0.1:8810) and Netdata.
+#  16.  Prints a summary including the next operator step (Uptime Kuma admin
 #       account creation, see README).
 
 set -eEuo pipefail
@@ -74,6 +78,7 @@ export BEBOP_TOOLING_SYSLOG_IDENT
 : "${NODEJS_MAJOR_VERSION:=20}"
 : "${GARAGE_VERSION:=2.2.0}"
 : "${PHOENIXD_VERSION:=0.6.2}"
+: "${MONGODB_VERSION:=8.0}"
 : "${UPTIME_KUMA_IMAGE:=louislam/uptime-kuma:1}"
 : "${UPTIME_KUMA_HOST_PORT:=8810}"
 : "${BEBOP_TOOLING_INSTALL_PREFIX:=/usr/local/share/be-BOP-tooling}"
@@ -108,8 +113,7 @@ Options:
 
 Required environment in secrets.env:
   OVH_APPLICATION_KEY, OVH_APPLICATION_SECRET, OVH_CONSUMER_KEY,
-  OVH_DNS_ZONE, OVH_CLOUD_PROJECT_ID, OVH_MONGO_CLUSTER_ID,
-  OVH_MONGO_ENDPOINT_HOST, OVH_MONGO_ENDPOINT_PORT, plus SFTP/SMTP/Zulip/Kuma.
+  OVH_DNS_ZONE, plus SFTP/SMTP/Zulip/Kuma (all optional except OVH_*).
 See templates/secrets.env.example.
 EOF
 }
@@ -173,6 +177,16 @@ step_check_prerequisites() {
         die "systemctl not found — host must run systemd"
     fi
     log_info "systemd: present ✓"
+
+    # MongoDB 5.0+ requires AVX on amd64. ARM64 is fine without.
+    local arch
+    arch=$(dpkg --print-architecture 2>/dev/null || uname -m)
+    if [[ "$arch" == "amd64" || "$arch" == "x86_64" ]]; then
+        if ! grep -qE '^flags[[:space:]]*:.* avx( |$)' /proc/cpuinfo; then
+            die "MongoDB ${MONGODB_VERSION} requires CPU AVX support; this host's CPU does not advertise it (check /proc/cpuinfo)"
+        fi
+        log_info "CPU AVX: supported ✓"
+    fi
 }
 
 # === Secrets ============================================================
@@ -234,6 +248,50 @@ step_install_apt_packages() {
     )
     maybe_run run_privileged env DEBIAN_FRONTEND=noninteractive \
         apt-get install -y --no-install-recommends "${pkgs[@]}"
+}
+
+# === MongoDB APT repo + install =========================================
+step_install_mongodb() {
+    local list_file="/etc/apt/sources.list.d/mongodb-org-${MONGODB_VERSION}.list"
+    local keyring="/usr/share/keyrings/mongodb-server-${MONGODB_VERSION}.gpg"
+    if [[ -f "$list_file" && -f "$keyring" ]]; then
+        log_info "MongoDB ${MONGODB_VERSION} apt repo already configured ✓"
+    else
+        log_info "Configuring MongoDB ${MONGODB_VERSION} apt repository..."
+        local arch
+        arch=$(dpkg --print-architecture)
+        local os_codename=""
+        if [[ -f /etc/os-release ]]; then
+            # shellcheck source=/dev/null
+            . /etc/os-release
+            os_codename="${VERSION_CODENAME:-bookworm}"
+        fi
+        # MongoDB publishes per-arch repos (amd64, arm64). Debian 12 (bookworm)
+        # uses the corresponding component path under repo.mongodb.org.
+        maybe_run run_privileged bash -c "
+            curl -fsSL https://www.mongodb.org/static/pgp/server-${MONGODB_VERSION}.asc \
+                | gpg --batch --yes --dearmor -o '${keyring}' &&
+            echo 'deb [arch=${arch} signed-by=${keyring}] https://repo.mongodb.org/apt/debian ${os_codename}/mongodb-org/${MONGODB_VERSION} main' \
+                > '${list_file}'
+        "
+        maybe_run run_privileged env DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    fi
+    log_info "Installing mongodb-org + mongodb-mongosh + mongodb-database-tools..."
+    maybe_run run_privileged env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        mongodb-org mongodb-mongosh mongodb-database-tools
+
+    # Mask the default mongod.service that ships with mongodb-org. We use
+    # per-tenant mongod@<tenant>.service instances instead. Masking is
+    # idempotent and survives package upgrades.
+    if systemctl list-unit-files mongod.service --no-legend 2>/dev/null | grep -q .; then
+        if ! systemctl is-enabled mongod.service 2>/dev/null | grep -qx 'masked'; then
+            log_info "Masking default mongod.service (per-tenant template instances are used instead)..."
+            maybe_run run_privileged systemctl disable --now mongod.service 2>/dev/null || true
+            maybe_run run_privileged systemctl mask mongod.service
+        else
+            log_info "default mongod.service already masked ✓"
+        fi
+    fi
 }
 
 # === Node.js + pnpm =====================================================
@@ -334,6 +392,10 @@ step_setup_directories() {
     maybe_run run_privileged install -d -m 0700 /etc/be-BOP-tooling
     maybe_run run_privileged install -d -m 0755 /etc/phoenixd
     maybe_run run_privileged install -d -m 0755 /var/lib/phoenixd
+    # Per-tenant mongod parents (StateDirectory in mongod@.service creates the
+    # per-instance subdirs; we just ensure the parents exist for consistency).
+    maybe_run run_privileged install -d -m 0755 /etc/be-BOP-mongodb
+    maybe_run run_privileged install -d -m 0755 /var/lib/be-BOP-mongodb
     # Garage state & config dirs (Garage service handles its own state via
     # StateDirectory, but we create the meta/data parents explicitly).
     maybe_run run_privileged install -d -m 0755 /var/lib/garage
@@ -531,6 +593,9 @@ step_install_template_units() {
     maybe_run run_privileged install -m 0644 \
         "${BEBOP_TOOLING_TEMPLATE_DIR}/phoenixd@.service" \
         /etc/systemd/system/phoenixd@.service
+    maybe_run run_privileged install -m 0644 \
+        "${BEBOP_TOOLING_TEMPLATE_DIR}/mongod@.service" \
+        /etc/systemd/system/mongod@.service
     maybe_run run_privileged systemctl daemon-reload
 }
 
@@ -617,6 +682,8 @@ step_print_summary() {
 Versions installed:
   Node.js:    $(node --version 2>/dev/null || echo '?')
   pnpm:       $(pnpm --version 2>/dev/null || echo '?')
+  MongoDB:    $(mongod --version 2>/dev/null | head -1 || echo '?')
+  mongosh:    $(mongosh --version 2>/dev/null || echo '?')
   Garage:     v${GARAGE_VERSION}
   phoenixd:   ${PHOENIXD_VERSION}
   certbot:    $(certbot --version 2>/dev/null || echo '?')
@@ -626,11 +693,13 @@ Key paths:
   Tenant registry        /var/lib/be-BOP/tenants.tsv
   Per-tenant config      /etc/be-BOP/<tenant>/config.env
   Per-tenant releases    /var/lib/be-BOP/<tenant>/releases/
+  Per-tenant mongod      /var/lib/be-BOP-mongodb/<tenant>/   (state)
+                         /etc/be-BOP-mongodb/<tenant>/port.env
   Phoenixd data          /var/lib/phoenixd/<tenant>/.phoenix/
   Garage state           /var/lib/garage/{meta,data}/
   Secrets                ${SECRETS_FILE}    (mode 0600)
   Cert OVH credentials   /etc/letsencrypt/ovh.ini       (mode 0600)
-  Template units         /etc/systemd/system/{bebop,phoenixd}@.service
+  Template units         /etc/systemd/system/{bebop,phoenixd,mongod}@.service
   Tooling libs           ${BEBOP_TOOLING_INSTALL_PREFIX}/lib/
 
 Services running:
@@ -673,6 +742,7 @@ main() {
 
     step_install_apt_packages
     step_install_nodejs_pnpm
+    step_install_mongodb
     step_install_garage_binary
     step_install_phoenixd_binary
 

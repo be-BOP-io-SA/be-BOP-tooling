@@ -31,9 +31,10 @@ Options:
 
 ```
  1. status decision         — read registry, branch
- 2. derive identifiers      — domain, ports, bucket+key names, mongo db+user
+ 2. derive identifiers      — domain, ports (incl. mongo), bucket+key names, mongo db
  3. DNS records             — POST 2× A records via OVH, refresh zone
- 4. Managed Mongo           — create DB + scoped user, wait for READY
+ 4. local mongod            — write port.env, systemctl enable --now mongod@<id>,
+                              wait ready, rs.initiate() (single-node rs0)
  5. Garage                  — bucket create, key create, allow rwO, set quota
  6. directory skeleton      — /var/lib/be-BOP/<id>/, /etc/be-BOP/<id>/, …
  7. release                 — download + extract + pnpm install + symlink
@@ -54,14 +55,18 @@ and Zulip with the failed phase, exit code, and undo report.
 
 When called with `--reactivate` against a `soft-deleted` tenant:
 
-- Phases 4 (Mongo), 5 (Garage), 6 (directories), 7 (release),
+- Phases 5 (Garage), 6 (directories), 7 (release),
   8 (phoenixd port.env / seed) are **skipped** — those resources are
   already there.
+- Phase 4 collapses to `systemctl enable --now mongod@<id>` (no
+  rs.initiate; the replica set is already initialised on the preserved
+  dbPath).
 - Phases 3 (DNS), 9 (rewrite config.env from preserved values), 10 (cert
   is idempotent — skipped if already issued), 11 (vhost), 12 (services),
   13 (healthcheck), 14 (registry → status=active) **do** run.
-- Mongo password, Garage key secret, phoenixd seed: NOT re-derived;
-  re-read from the preserved `config.env` and seed file on disk.
+- Garage key secret + phoenixd password: re-read from preserved
+  `config.env`. MONGODB_URL is re-derived from the registry's mongo_port
+  + mongodb_database (deterministic, no creds to pull).
 
 ## Idempotent re-apply
 
@@ -95,8 +100,8 @@ The transaction stack records an undo command after each successful step:
 ```
 DNS A record <id>      → ovh_dns_record_delete + zone refresh
 DNS A record s3.<id>   → ovh_dns_record_delete + zone refresh
-Mongo DB               → ovh_mongo_db_delete <db_id>
-Mongo user             → ovh_mongo_user_delete <user_id>
+mongod port.env        → rm -rf /etc/be-BOP-mongodb/<id>/
+mongod@<id>.service    → systemctl disable --now + rm -rf /var/lib/be-BOP-mongodb/<id>/
 Garage bucket          → garage_bucket_delete <bucket>
 Garage key             → garage_key_delete <key>
 tenant directory tree  → rm -rf /var/lib/... /etc/be-BOP/<id>/ ...
@@ -116,7 +121,8 @@ but don't abort the rollback.
 
 | Symptom                                          | What to do                                |
 |--------------------------------------------------|-------------------------------------------|
-| Script exited mid-phase, rollback succeeded      | Fix the underlying cause (e.g. OVH outage) and re-run `add-tenant.sh` from scratch |
+| Script exited mid-phase, rollback succeeded      | Fix the underlying cause (e.g. OVH DNS API outage) and re-run `add-tenant.sh` from scratch |
+| `mongod@<id> did not become ready within 60s`    | Check `journalctl -u mongod@<id>`; usually a port collision, dbPath permissions, or AVX-missing CPU. |
 | Rollback also failed (network glitch)            | Check the alert email/Zulip for the list of un-undone steps; clean them by hand or via `remove-tenant.sh --purge` then re-run |
 | `cert: timeout waiting for DNS-01 propagation`   | Re-run; OVH propagation is usually < 60 s but can spike. Or increase `--dns-ovh-propagation-seconds` in phase_certificate (currently 60). |
 | `pnpm install failed`                            | Network or disk issue. Check `journalctl -t bebop-tooling-add-tenant`, fix, re-run. |

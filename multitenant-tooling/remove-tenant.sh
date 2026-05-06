@@ -13,12 +13,11 @@
 #
 #   --archive
 #       Soft-delete first (if active), then export Garage bucket + tenant
-#       config + phoenixd state into a tarball, encrypt with
+#       config + phoenixd state + mongodump into a tarball, encrypt with
 #       BACKUP_ENCRYPTION_KEY (openssl AES-256-CBC + PBKDF2), upload to
 #       the SFTP destination defined in secrets.env, verify, then drop
-#       Mongo DB + user + Garage bucket + key + local files.
-#       Sets status=archived. NOTE: Mongo dumps are NOT included — OVH
-#       Managed Mongo does daily provider-side backups (see README).
+#       the Garage bucket + key + local mongod state + local files.
+#       Sets status=archived.
 #
 #   --purge
 #       Nuclear: delete everything, no archive. Refuses unless interactive
@@ -49,6 +48,8 @@ source "$BEBOP_TOOLING_LIB_DIR/sudo.sh"
 source "$BEBOP_TOOLING_LIB_DIR/registry.sh"
 # shellcheck source=lib/ovh.sh
 source "$BEBOP_TOOLING_LIB_DIR/ovh.sh"
+# shellcheck source=lib/mongo.sh
+source "$BEBOP_TOOLING_LIB_DIR/mongo.sh"
 # shellcheck source=lib/garage.sh
 source "$BEBOP_TOOLING_LIB_DIR/garage.sh"
 # shellcheck source=lib/notify.sh
@@ -129,10 +130,10 @@ S3_DOMAIN=""
 ZONE=""
 BEBOP_PORT=""
 PHOENIXD_PORT=""
+MONGO_PORT=""
 GARAGE_BUCKET=""
 GARAGE_KEY_NAME=""
 MONGO_DB_NAME=""
-MONGO_USER_NAME=""
 BEBOP_VERSION=""
 
 # === Helpers ============================================================
@@ -164,14 +165,17 @@ delete_dns_records() {
     ovh_dns_zone_refresh
 }
 
-# Drop Mongo DB + scoped user.
+# Stop and remove the per-tenant mongod instance + its data dir.
+# Used by archive/purge paths only — soft-delete just stops the unit.
 drop_mongo_resources() {
-    log_info "dropping Mongo db=${MONGO_DB_NAME} user=${MONGO_USER_NAME}..."
-    local user_id db_id
-    user_id=$(ovh_mongo_user_find_id "$MONGO_USER_NAME" 2>/dev/null || true)
-    [[ -n "$user_id" ]] && ovh_mongo_user_delete "$user_id"
-    db_id=$(ovh_mongo_db_find_id "$MONGO_DB_NAME" 2>/dev/null || true)
-    [[ -n "$db_id" ]] && ovh_mongo_db_delete "$db_id"
+    log_info "dropping local mongod for ${TENANT_ID} (port=${MONGO_PORT})..."
+    stop_disable_unit "mongod@${TENANT_ID}.service"
+    if [[ "$DRY_RUN" != "true" ]]; then
+        run_privileged rm -rf \
+            "/var/lib/be-BOP-mongodb/${TENANT_ID}" \
+            "/etc/be-BOP-mongodb/${TENANT_ID}"
+    fi
+    log_info "mongod state purged for ${TENANT_ID}"
 }
 
 # Drop Garage bucket + key.
@@ -230,14 +234,13 @@ load_tenant_from_registry() {
     DOMAIN=$(registry_get_field "$TENANT_ID" domain)
     BEBOP_PORT=$(registry_get_field "$TENANT_ID" bebop_port)
     PHOENIXD_PORT=$(registry_get_field "$TENANT_ID" phoenixd_port)
+    MONGO_PORT=$(registry_get_field "$TENANT_ID" mongo_port)
     MONGO_DB_NAME=$(registry_get_field "$TENANT_ID" mongodb_database)
     GARAGE_BUCKET=$(registry_get_field "$TENANT_ID" garage_bucket)
     GARAGE_KEY_NAME=$(registry_get_field "$TENANT_ID" garage_key)
     BEBOP_VERSION=$(registry_get_field "$TENANT_ID" bebop_version)
     ZONE="${OVH_DNS_ZONE:-}"
     S3_DOMAIN="s3.${TENANT_ID}.${ZONE}"
-    # Mongo user follows the same convention as add-tenant.sh.
-    MONGO_USER_NAME="bebop_${TENANT_ID//-/_}"
 }
 
 # === Soft-delete ========================================================
@@ -246,6 +249,7 @@ run_soft_delete() {
 
     stop_disable_unit "bebop@${TENANT_ID}.service"
     stop_disable_unit "phoenixd@${TENANT_ID}.service"
+    stop_disable_unit "mongod@${TENANT_ID}.service"
 
     disable_nginx_vhost
 
@@ -265,7 +269,7 @@ run_soft_delete() {
   Tenant '${TENANT_ID}' soft-deleted
 ==========================================================================
   Data preserved:
-    - Mongo DB:           ${MONGO_DB_NAME}
+    - Mongo data:         /var/lib/be-BOP-mongodb/${TENANT_ID}/  (db: ${MONGO_DB_NAME}, port: ${MONGO_PORT})
     - Garage bucket:      ${GARAGE_BUCKET}
     - Phoenixd seed:      /var/lib/phoenixd/${TENANT_ID}/.phoenix/seed.dat
     - be-BOP releases:    /var/lib/be-BOP/${TENANT_ID}/releases/
@@ -285,6 +289,7 @@ build_archive() {
     run_privileged install -d -m 0700 "${workdir}/etc-be-BOP"
     run_privileged install -d -m 0700 "${workdir}/var-lib-phoenixd"
     run_privileged install -d -m 0700 "${workdir}/bucket"
+    run_privileged install -d -m 0700 "${workdir}/mongo-dump"
 
     # Per-tenant config + state (skip the live releases dir — it's just code,
     # we record the tag in metadata.json so a restore can re-download).
@@ -293,6 +298,24 @@ build_archive() {
     fi
     if run_privileged test -d "/var/lib/phoenixd/${TENANT_ID}"; then
         run_privileged cp -a "/var/lib/phoenixd/${TENANT_ID}/." "${workdir}/var-lib-phoenixd/"
+    fi
+
+    # Mongo dump: the mongod is still running at this point in the archive
+    # flow (we stopped bebop+phoenixd, but kept mongod alive precisely to
+    # dump it consistently). After the dump we'll stop it via drop_mongo_resources.
+    if [[ -n "$MONGO_PORT" && -n "$MONGO_DB_NAME" ]]; then
+        # Best-effort: ensure mongod is reachable. If it was already stopped
+        # by a prior soft-delete, restart it briefly for the dump.
+        if ! mongo_wait_ready "$MONGO_PORT" 5 1 2>/dev/null; then
+            log_info "archive: mongod@${TENANT_ID} not running; starting it briefly for mongodump..."
+            run_privileged systemctl start "mongod@${TENANT_ID}.service"
+            mongo_wait_ready "$MONGO_PORT" 30 1 \
+                || log_warn "archive: could not bring mongod@${TENANT_ID} up; mongodump SKIPPED"
+        fi
+        if mongo_wait_ready "$MONGO_PORT" 1 1 2>/dev/null; then
+            mongo_dump_db "$MONGO_PORT" "$MONGO_DB_NAME" "${workdir}/mongo-dump" \
+                || log_warn "archive: mongodump failed for ${MONGO_DB_NAME}"
+        fi
     fi
 
     # Garage bucket dump via rclone (S3 → local).
@@ -319,14 +342,14 @@ build_archive() {
   "domain":              "${DOMAIN}",
   "bebop_port":          ${BEBOP_PORT},
   "phoenixd_port":       ${PHOENIXD_PORT},
+  "mongo_port":          ${MONGO_PORT},
   "bebop_version":       "${BEBOP_VERSION}",
   "mongodb_database":    "${MONGO_DB_NAME}",
-  "mongodb_user":        "${MONGO_USER_NAME}",
   "garage_bucket":       "${GARAGE_BUCKET}",
   "garage_key":          "${GARAGE_KEY_NAME}",
   "archived_at":         "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
-  "archive_format":      "1",
-  "note":                "Mongo data is NOT included; rely on OVH provider-side daily backups."
+  "archive_format":      "2",
+  "note":                "Includes a mongodump of the per-tenant DB under mongo-dump/."
 }
 EOF
 
@@ -430,10 +453,11 @@ run_archive() {
     - /var/lib/be-BOP/${TENANT_ID}/
     - /var/lib/phoenixd/${TENANT_ID}/
     - /etc/phoenixd/${TENANT_ID}/
+    - /etc/be-BOP-mongodb/${TENANT_ID}/
+    - /var/lib/be-BOP-mongodb/${TENANT_ID}/  (mongod data)
     - nginx vhost bebop-${TENANT_ID}
     - Let's Encrypt cert bebop-${TENANT_ID}
     - DNS A records ${DOMAIN} + s3.${TENANT_ID}.${ZONE}
-    - Mongo DB ${MONGO_DB_NAME} + user ${MONGO_USER_NAME}
     - Garage bucket ${GARAGE_BUCKET} + key ${GARAGE_KEY_NAME}
 
   Registry row preserved with status=archived for audit trail.
@@ -453,7 +477,7 @@ run_purge() {
         echo
         echo "About to PERMANENTLY destroy tenant '${TENANT_ID}':"
         echo "  - DNS records, nginx vhost, Let's Encrypt cert"
-        echo "  - Mongo DB '${MONGO_DB_NAME}' and user '${MONGO_USER_NAME}'"
+        echo "  - Mongo DB '${MONGO_DB_NAME}' (local mongod on port ${MONGO_PORT}) + dbPath"
         echo "  - Garage bucket '${GARAGE_BUCKET}' and key '${GARAGE_KEY_NAME}'"
         echo "  - phoenixd seed (/var/lib/phoenixd/${TENANT_ID}/.phoenix/seed.dat)"
         echo "  - all be-BOP releases and config"

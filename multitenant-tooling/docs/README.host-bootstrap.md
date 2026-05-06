@@ -41,37 +41,43 @@ Options:
 ## What it does
 
 1. Validates the host: Debian 12, ≥ 2 GiB RAM, ≥ 20 GiB free on `/var`,
-   systemd present.
+   systemd present, **CPU AVX support** (required by MongoDB 5.0+ on amd64).
 2. Loads `/etc/be-BOP-tooling/secrets.env`.
 3. Pings the OVH API (`GET /me`) to verify credentials.
 4. Installs apt packages: `nginx`, `certbot` + `python3-certbot-dns-ovh`,
-   `docker.io`, `netdata`, plus `curl jq stow rclone xxd flock unzip openssl`.
+   `docker.io`, `netdata`, plus `curl jq stow rclone xxd unzip openssl`.
 5. Configures the NodeSource repo and installs Node.js + corepack/pnpm.
-6. Downloads & stows Garage (`/usr/local/garage/garage-v<VER>/`).
-7. Downloads & stows phoenixd (`/usr/local/phoenixd/phoenixd-<VER>/`).
-8. Creates the directory skeleton: `/var/lib/be-BOP/`, `/etc/be-BOP/`,
-   `/etc/be-BOP-tooling/`, `/etc/phoenixd/`, `/var/lib/phoenixd/`.
-9. Creates the `be-bop-cli` system user (parity with v1).
-10. Writes `/etc/garage.toml` (no `root_domain` — see root README) and
+6. Configures the **MongoDB official APT repo** (signed) and installs
+   `mongodb-org`, `mongodb-mongosh`, `mongodb-database-tools`. Masks the
+   default `mongod.service` (we use per-tenant `mongod@<tenant>.service`
+   template instances, started by `add-tenant.sh`).
+7. Downloads & stows Garage (`/usr/local/garage/garage-v<VER>/`).
+8. Downloads & stows phoenixd (`/usr/local/phoenixd/phoenixd-<VER>/`).
+9. Creates the directory skeleton: `/var/lib/be-BOP/`, `/etc/be-BOP/`,
+   `/etc/be-BOP-tooling/`, `/etc/phoenixd/`, `/var/lib/phoenixd/`,
+   `/etc/be-BOP-mongodb/`, `/var/lib/be-BOP-mongodb/`.
+10. Creates the `be-bop-cli` system user (parity with v1).
+11. Writes `/etc/garage.toml` (no `root_domain` — see root README) and
     `/etc/systemd/system/garage.service`, starts Garage, applies layout.
-11. Writes a 444 catch-all default nginx vhost; enables nginx.
-12. Installs `/etc/letsencrypt/ovh.ini` (mode 0600) for certbot DNS-01.
-13. Installs the systemd template units `bebop@.service` and
-    `phoenixd@.service`.
-14. Installs the tooling libs to
+12. Writes a 444 catch-all default nginx vhost; enables nginx.
+13. Installs `/etc/letsencrypt/ovh.ini` (mode 0600) for certbot DNS-01.
+14. Installs the systemd template units `bebop@.service`,
+    `phoenixd@.service`, **`mongod@.service`**.
+15. Installs the tooling libs to
     `/usr/local/share/be-BOP-tooling/lib/` and the per-tenant scripts to
     `/usr/local/bin/`.
-15. Initialises `/var/lib/be-BOP/tenants.tsv` (header only).
-16. Pulls and starts Uptime Kuma in Docker, bound to `127.0.0.1:8810`.
-17. Enables Netdata.
-18. Prints a summary.
+16. Initialises `/var/lib/be-BOP/tenants.tsv` (header only).
+17. Pulls and starts Uptime Kuma in Docker, bound to `127.0.0.1:8810`.
+18. Enables Netdata.
+19. Prints a summary.
 
 ## What it does NOT do
 
 - Issue any TLS certificate (per-tenant SAN certs are issued by
   `add-tenant.sh`).
 - Create any tenant.
-- Install MongoDB locally — be-BOP uses OVH Managed Mongo.
+- Start any mongod. The default `mongod.service` is masked; per-tenant
+  `mongod@<tenant>.service` instances are started by `add-tenant.sh`.
 
 ## Configurable versions
 
@@ -118,6 +124,7 @@ monitor creation is currently not feasible against Kuma 1.x.)
 | `secrets.env mode is XXX; should be 600`    | `chmod 600 /etc/be-BOP-tooling/secrets.env` |
 | `OVH API ping failed`                       | Wrong OVH keys, or consumer key expired. Regenerate at https://api.ovh.com/createToken/ |
 | `Garage did not become ready in 30s`        | First start may take longer on slow disks; re-run, or check `journalctl -u garage` |
+| `MongoDB ${MONGODB_VERSION} requires CPU AVX support` | Your CPU is too old (or KVM is hiding the AVX flag). Either pick a newer host or override `MONGODB_VERSION=4.4` and accept the security tradeoffs. |
 | `nginx -t` fails after re-run               | Hand-edited vhost? The default catch-all is regenerated on every run; unrelated vhosts under `sites-available` are not touched |
 | Uptime Kuma container `Exited (137)`        | OOM. Bump VDS RAM or set memory limit on the container |
 
