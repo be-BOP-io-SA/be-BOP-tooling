@@ -40,11 +40,15 @@ mongo_wait_ready() {
 
 # mongo_init_rs <port>
 # Idempotent: skips if rs.status() is already OK on the target instance.
+#
+# All status probes use `|| true` because mongosh exits non-zero when the
+# replica set is not yet initialised — without that guard, `set -e` +
+# `pipefail` kill the surrounding script before we even reach rs.initiate().
 mongo_init_rs() {
     local port="$1"
     local status
     status=$(mongosh --quiet --port "$port" --eval "rs.status().ok" 2>/dev/null \
-        | tr -d '[:space:]' | tail -c 1)
+        | tr -d '[:space:]' | tail -c 1 || true)
     if [[ "$status" == "1" ]]; then
         log_info "mongo: replica set on 127.0.0.1:${port} already initialised ✓"
         return 0
@@ -59,7 +63,7 @@ mongo_init_rs() {
     local i
     for (( i=1; i<=10; i++ )); do
         status=$(mongosh --quiet --port "$port" --eval "rs.status().ok" 2>/dev/null \
-            | tr -d '[:space:]' | tail -c 1)
+            | tr -d '[:space:]' | tail -c 1 || true)
         [[ "$status" == "1" ]] && { log_info "mongo: rs OK on 127.0.0.1:${port}"; return 0; }
         sleep 1
     done
