@@ -11,9 +11,7 @@ to the original `be-bop-bootstrap/` so the v1 single-host wizard keeps
 working untouched and upstream merges remain trivial.
 
 > **Status:** PoC — embryo of the commercial be-bop.io SaaS. The directory
-> structure, registry schema, and CLI flags are stable; the Uptime Kuma
-> integration and full Mongo dump in archives are still manual (see
-> [Limitations](#limitations)).
+> structure, registry schema, and CLI flags are stable.
 
 ---
 
@@ -174,7 +172,8 @@ multitenant-tooling/
 │   ├── mongo.sh                    per-tenant mongod helpers (mongosh wrappers)
 │   ├── garage.sh                   bucket/key/quota wrappers
 │   ├── notify.sh                   SMTP + Zulip operator alerts
-│   ├── uptime-kuma.sh              monitor register/unregister (manual stub)
+│   ├── uptime-kuma.sh              monitor register/unregister (Socket.IO via kuma-cli.py)
+│   ├── kuma-cli.py                 Python wrapper around uptime-kuma-api
 │   ├── healthcheck.sh              http_wait_ok / tcp_port_open
 │   └── release.sh                  GitHub release download + pnpm install
 ├── templates/
@@ -302,12 +301,6 @@ Leave this for v2.
 
 ## Limitations
 
-- **Uptime Kuma integration is manual.** Kuma's REST API in 1.x is too
-  limited to programmatically create monitors. `add-tenant.sh` emits
-  operator instructions; the operator clicks "Add Monitor" in the Kuma
-  UI. When Kuma 2.x ships a stable monitor REST API, replace
-  `lib/uptime-kuma.sh`'s stubs with real calls — function signatures
-  are kept compatible.
 - **No multi-VDS yet.** Cross-host failover, rebalancing, or live
   migration is out of scope. The PoC targets a single Contabo VDS.
 - **`migrate-tenant.sh` not yet implemented.** Importing an existing
@@ -323,7 +316,6 @@ Leave this for v2.
 
 | Item                                         | Phase   |
 |----------------------------------------------|---------|
-| Replace Kuma manual stubs with REST calls    | when 2.x lands |
 | `restore-tenant.sh` from SFTP archive        | v2      |
 | `migrate-tenant.sh` from a single-host setup | v2      |
 | Multi-VDS / failover                         | v3      |
