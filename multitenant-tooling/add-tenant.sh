@@ -429,18 +429,30 @@ phase_config_env() {
     log_info "config.env installed (mode 0640)"
 }
 
-# Phase 10: TLS cert (per-tenant SAN, DNS-01 OVH)
+# Phase 10: TLS cert (per-tenant SAN, DNS-01 via custom OVH hook)
+#
+# We use certbot --manual + our own auth/cleanup hooks instead of the
+# certbot-dns-ovh plugin. The plugin requires an OVH token scoped to
+# /domain/* (it lists all zones for auto-discovery); our hooks know
+# the zone from secrets.env and only need GET/POST/DELETE under
+# /domain/zone/<OVH_DNS_ZONE>/* — strictly tenant-scoped.
 phase_certificate() {
-    log_info "phase 10: Let's Encrypt cert (DNS-01 OVH)..."
+    log_info "phase 10: Let's Encrypt cert (DNS-01 via custom OVH hook)..."
     if run_privileged test -d "/etc/letsencrypt/live/${CERT_NAME}"; then
         log_info "cert ${CERT_NAME} already issued — skipping certbot"
         return 0
     fi
+    local hooks_dir="/usr/local/share/be-BOP-tooling/hooks"
+    if [[ -d "${SCRIPT_DIR}/hooks" ]]; then
+        # source-tree layout (running from a checkout)
+        hooks_dir="${SCRIPT_DIR}/hooks"
+    fi
     local certbot_args=(
         certonly
-        --dns-ovh
-        --dns-ovh-credentials /etc/letsencrypt/ovh.ini
-        --dns-ovh-propagation-seconds 60
+        --manual
+        --preferred-challenges dns-01
+        --manual-auth-hook "${hooks_dir}/certbot-ovh-auth.sh"
+        --manual-cleanup-hook "${hooks_dir}/certbot-ovh-cleanup.sh"
         --non-interactive --agree-tos
         --email "$ADMIN_EMAIL"
         --cert-name "$CERT_NAME"

@@ -22,8 +22,10 @@
 #   2.  Loads /etc/be-BOP-tooling/secrets.env.
 #   3.  Verifies OVH API credentials work (calls /me).
 #   4.  Installs apt packages: nodejs, pnpm, mongodb-org + mongodb-mongosh +
-#       mongodb-database-tools, certbot+dns-ovh, nginx, docker, netdata, plus
-#       the build/runtime deps (curl, jq, stow, openssl, unzip).
+#       mongodb-database-tools, certbot, nginx, docker, netdata, plus
+#       the build/runtime deps (curl, jq, stow, openssl, unzip, python3-venv).
+#       certbot's DNS-01 OVH challenge is handled by hooks/ scripts using
+#       our own zone-scoped OVH token, so no certbot-dns-ovh plugin needed.
 #   5.  Downloads & stows Garage and phoenixd binaries.
 #   6.  Creates the /var/lib/be-BOP/, /etc/be-BOP/, /etc/be-BOP-tooling/,
 #       /etc/phoenixd/, /etc/be-BOP-mongodb/, /var/lib/be-BOP-mongodb/ skeleton.
@@ -32,7 +34,9 @@
 #   8.  Masks the default mongod.service (we use per-tenant template instances).
 #   9.  Writes /etc/garage.toml + garage.service, starts Garage, applies layout.
 #  10.  Writes a 444 catch-all default vhost for nginx, then enables nginx.
-#  11.  Installs /etc/letsencrypt/ovh.ini (mode 0600) for certbot DNS-01.
+#  11.  (No-op now — kept for backwards compat: removes the legacy
+#       /etc/letsencrypt/ovh.ini if present, certbot --manual hooks read
+#       OVH creds directly from secrets.env.)
 #  12.  Installs systemd template units bebop@, phoenixd@, mongod@.
 #  13.  Installs tooling libs (/usr/local/share/be-BOP-tooling/lib/) and the
 #       per-tenant scripts ({add,remove,upgrade}-tenant.sh, upgrade-all.sh).
@@ -242,7 +246,7 @@ step_install_apt_packages() {
         util-linux
         rclone
         nginx
-        certbot python3-certbot-dns-ovh
+        certbot
         python3-venv python3-pip
         docker.io
         netdata
@@ -565,24 +569,16 @@ step_start_nginx() {
     maybe_run run_privileged systemctl enable --now nginx
 }
 
-# === certbot OVH credentials ============================================
-step_install_ovh_credentials_for_certbot() {
-    if [[ "$DEFER_SECRETS" == "true" && -z "${OVH_APPLICATION_KEY:-}" ]]; then
-        log_info "Skipping certbot OVH credentials (--defer-secrets) — re-run after editing secrets.env"
-        return 0
+# === certbot OVH credentials (no longer needed) =========================
+# certbot-dns-ovh has been replaced by certbot --manual + our hooks/
+# scripts (see add-tenant.sh::phase_certificate). The hooks read OVH
+# creds from /etc/be-BOP-tooling/secrets.env directly, so /etc/letsencrypt/ovh.ini
+# is no longer used. We remove a stale one if it exists from a prior install.
+step_remove_legacy_ovh_ini() {
+    if [[ -f /etc/letsencrypt/ovh.ini ]]; then
+        log_info "Removing legacy /etc/letsencrypt/ovh.ini (now obsolete)..."
+        maybe_run run_privileged rm -f /etc/letsencrypt/ovh.ini
     fi
-    log_info "Installing /etc/letsencrypt/ovh.ini..."
-    local tmp
-    tmp=$(mktemp)
-    cat > "$tmp" <<EOF
-# OVH API credentials for certbot-dns-ovh — managed by host-bootstrap.sh
-dns_ovh_endpoint = ovh-eu
-dns_ovh_application_key = ${OVH_APPLICATION_KEY}
-dns_ovh_application_secret = ${OVH_APPLICATION_SECRET}
-dns_ovh_consumer_key = ${OVH_CONSUMER_KEY}
-EOF
-    maybe_run run_privileged install -m 0600 "$tmp" /etc/letsencrypt/ovh.ini
-    rm -f "$tmp"
 }
 
 # === systemd template units =============================================
@@ -605,6 +601,7 @@ step_install_tooling_libs_and_scripts() {
     log_info "Installing tooling libs to ${BEBOP_TOOLING_INSTALL_PREFIX}..."
     maybe_run run_privileged install -d -m 0755 "${BEBOP_TOOLING_INSTALL_PREFIX}/lib"
     maybe_run run_privileged install -d -m 0755 "${BEBOP_TOOLING_INSTALL_PREFIX}/templates"
+    maybe_run run_privileged install -d -m 0755 "${BEBOP_TOOLING_INSTALL_PREFIX}/hooks"
     local f
     for f in "${BEBOP_TOOLING_LIB_DIR}"/*.sh "${BEBOP_TOOLING_LIB_DIR}"/*.py; do
         [[ -f "$f" ]] || continue
@@ -613,6 +610,14 @@ step_install_tooling_libs_and_scripts() {
     for f in "${BEBOP_TOOLING_TEMPLATE_DIR}"/*; do
         maybe_run run_privileged install -m 0644 "$f" "${BEBOP_TOOLING_INSTALL_PREFIX}/templates/"
     done
+    # certbot --manual hooks: must be executable.
+    local hooks_src="${SCRIPT_DIR}/hooks"
+    if [[ -d "$hooks_src" ]]; then
+        for f in "$hooks_src"/*.sh; do
+            [[ -f "$f" ]] || continue
+            maybe_run run_privileged install -m 0755 "$f" "${BEBOP_TOOLING_INSTALL_PREFIX}/hooks/"
+        done
+    fi
     log_info "Installing per-tenant scripts to /usr/local/bin/..."
     local script
     for script in add-tenant.sh remove-tenant.sh upgrade-tenant.sh upgrade-all.sh; do
@@ -805,7 +810,7 @@ Key paths:
   Phoenixd data          /var/lib/phoenixd/<tenant>/.phoenix/
   Garage state           /var/lib/garage/{meta,data}/
   Secrets                ${SECRETS_FILE}    (mode 0600)
-  Cert OVH credentials   /etc/letsencrypt/ovh.ini       (mode 0600)
+  Certbot OVH hooks      ${BEBOP_TOOLING_INSTALL_PREFIX}/hooks/   (read OVH creds from secrets.env)
   Template units         /etc/systemd/system/{bebop,phoenixd,mongod}@.service
   Tooling libs           ${BEBOP_TOOLING_INSTALL_PREFIX}/lib/
 
@@ -864,7 +869,7 @@ main() {
     step_write_nginx_default_vhost
     step_start_nginx
 
-    step_install_ovh_credentials_for_certbot
+    step_remove_legacy_ovh_ini
     step_install_template_units
     step_install_tooling_libs_and_scripts
     step_init_registry
