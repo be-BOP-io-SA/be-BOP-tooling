@@ -262,6 +262,97 @@ phase_derive_identifiers() {
     log_info "domain: https://${DOMAIN} (S3: https://${S3_DOMAIN})"
 }
 
+# Phase 2.5: clean any orphan resources from a prior failed fresh run.
+#
+# The transactional rollback in run_fresh_creation walks the undo stack
+# in reverse, but only undoes steps that completed AND registered their
+# undo. A failure mid-step (e.g. garage_key_create succeeds then the
+# script is killed before the undo registers; or a phase fails before
+# its half-created resources are tracked) leaves the system with
+# orphan state that breaks the next add-tenant attempt.
+#
+# This phase only runs in DECISION_PATH=fresh (tenant absent from
+# registry) — by definition no live service references these orphans
+# so destruction is safe. We don't call this from reactivate/reapply
+# paths, where every resource we'd find IS the live one.
+phase_clean_orphans() {
+    log_info "phase 2.5: scanning for orphan resources from prior failed runs..."
+    local cleaned=0
+    # OVH DNS records
+    local id
+    id=$(ovh_dns_record_find "$TENANT_ID" A 2>/dev/null || true)
+    if [[ -n "$id" ]]; then
+        log_warn "orphan: DNS A ${DOMAIN} (id=${id}); deleting"
+        ovh_dns_record_delete "$id" || log_warn "orphan: DNS delete failed for ${id} — continuing"
+        cleaned=1
+    fi
+    id=$(ovh_dns_record_find "s3.${TENANT_ID}" A 2>/dev/null || true)
+    if [[ -n "$id" ]]; then
+        log_warn "orphan: DNS A ${S3_DOMAIN} (id=${id}); deleting"
+        ovh_dns_record_delete "$id" || log_warn "orphan: DNS delete failed for ${id} — continuing"
+        cleaned=1
+    fi
+    [[ "$cleaned" == 1 ]] && ovh_dns_zone_refresh
+
+    # Stale systemd units (still enabled / active from a previous run).
+    local unit
+    for unit in "bebop@${TENANT_ID}.service" "phoenixd@${TENANT_ID}.service" "mongod@${TENANT_ID}.service"; do
+        if run_privileged systemctl list-unit-files --no-legend "$unit" 2>/dev/null | grep -q .; then
+            if run_privileged systemctl is-active --quiet "$unit" 2>/dev/null \
+               || run_privileged systemctl is-enabled --quiet "$unit" 2>/dev/null; then
+                log_warn "orphan: systemd unit ${unit}; disabling"
+                run_privileged systemctl disable --now "$unit" 2>/dev/null || true
+            fi
+        fi
+    done
+
+    # Local state + config dirs.
+    local dir
+    for dir in \
+        "/var/lib/be-BOP/${TENANT_ID}" \
+        "/etc/be-BOP/${TENANT_ID}" \
+        "/var/lib/be-BOP-mongodb/${TENANT_ID}" \
+        "/etc/be-BOP-mongodb/${TENANT_ID}" \
+        "/var/lib/phoenixd/${TENANT_ID}" \
+        "/etc/phoenixd/${TENANT_ID}"; do
+        if run_privileged test -d "$dir"; then
+            log_warn "orphan: ${dir}; removing"
+            run_privileged rm -rf "$dir"
+        fi
+    done
+
+    # Garage bucket + key.
+    if garage_key_exists "$GARAGE_KEY_NAME"; then
+        log_warn "orphan: garage key '${GARAGE_KEY_NAME}'; deleting"
+        garage_key_delete "$GARAGE_KEY_NAME"
+    fi
+    if garage_bucket_exists "$GARAGE_BUCKET"; then
+        log_warn "orphan: garage bucket '${GARAGE_BUCKET}'; deleting"
+        garage_bucket_delete "$GARAGE_BUCKET"
+    fi
+
+    # nginx vhost (sites-available + sites-enabled symlink).
+    if run_privileged test -e "/etc/nginx/sites-available/bebop-${TENANT_ID}.conf"; then
+        log_warn "orphan: nginx vhost bebop-${TENANT_ID}; removing"
+        run_privileged rm -f \
+            "/etc/nginx/sites-enabled/bebop-${TENANT_ID}.conf" \
+            "/etc/nginx/sites-available/bebop-${TENANT_ID}.conf"
+        run_privileged systemctl reload nginx 2>/dev/null || true
+    fi
+
+    # Let's Encrypt cert directory.
+    if run_privileged test -d "/etc/letsencrypt/live/${CERT_NAME}"; then
+        log_warn "orphan: Let's Encrypt cert ${CERT_NAME}; deleting"
+        run_privileged certbot delete --non-interactive --cert-name "${CERT_NAME}" 2>/dev/null \
+            || log_warn "orphan: certbot delete failed; continuing"
+    fi
+
+    # Kuma monitor (best-effort; helper warns if creds/URL missing).
+    kuma_unregister_tenant "$TENANT_ID" 2>/dev/null || true
+
+    log_info "phase 2.5: orphan cleanup complete"
+}
+
 # Phase 3: DNS A records (both <tenant>.<zone> and s3.<tenant>.<zone>)
 phase_dns() {
     log_info "phase 3: DNS A records via OVH..."
@@ -594,6 +685,7 @@ run_fresh_creation() {
     trap 'on_error_rollback' ERR
     detect_host_ip
     phase_derive_identifiers
+    phase_clean_orphans
     phase_dns
     phase_mongo
     phase_garage
