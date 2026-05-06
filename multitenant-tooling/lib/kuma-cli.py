@@ -60,10 +60,10 @@ def cmd_setup_admin(args):
         except Exception:
             pass
 
-        # Path B: fresh Kuma, no admin yet → setup_admin creates it.
+        # Path B: fresh Kuma, no admin yet → setup() creates it.
         try:
-            api.setup_admin(args.user, args.password)
-            # setup_admin doesn't always log us in; do it explicitly to verify.
+            api.setup(args.user, args.password)
+            # setup() doesn't always log us in; do it explicitly to verify.
             api.login(args.user, args.password)
             print(f"kuma-cli: created admin '{args.user}'")
             return 0
