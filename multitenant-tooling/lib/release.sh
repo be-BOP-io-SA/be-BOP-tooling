@@ -128,7 +128,12 @@ release_install_deps() {
         return 0
     fi
     log_info "release: pnpm install --prod --frozen-lockfile in ${target_dir}"
-    ( cd "$target_dir" && run_privileged env HOME=/tmp \
+    # COREPACK_ENABLE_DOWNLOAD_PROMPT=0 silences corepack's interactive
+    # confirmation when it auto-downloads the pnpm version pinned by
+    # the be-BOP release's package.json (otherwise add-tenant.sh hangs
+    # at phase 7 with "? Do you want to continue? [Y/n]").
+    ( cd "$target_dir" && run_privileged env \
+        HOME=/tmp COREPACK_ENABLE_DOWNLOAD_PROMPT=0 \
         pnpm install --prod --frozen-lockfile ) \
         || die "release: pnpm install failed for ${tag}"
     run_privileged touch "${target_dir}/.bebop_install_success"
