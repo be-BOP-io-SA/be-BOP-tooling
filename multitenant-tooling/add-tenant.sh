@@ -319,6 +319,16 @@ phase_garage() {
 }
 
 # Phase 6: per-tenant filesystem skeleton
+#
+# We deliberately do NOT pre-create the StateDirectory targets
+# (/var/lib/phoenixd/<id>, /var/lib/be-BOP-mongodb/<id>, /var/lib/be-BOP/<id>/state).
+# systemd's StateDirectory= sets these up with the right mode (0700) and
+# owner (DynamicUser) on first service start; pre-creating them as
+# root:root 0755 makes systemd fail with status=238/STATE_DIRECTORY
+# ("Failed to set up special execution directory").
+# We only create what bebop@.service expects to already exist (the
+# release tree under /var/lib/be-BOP/<id>/releases/) and the per-tenant
+# /etc/ trees that hold port.env / config.env.
 phase_directories() {
     log_info "phase 6: directory skeleton for tenant..."
     run_privileged install -d -m 0755 "/var/lib/be-BOP/${TENANT_ID}"
@@ -326,7 +336,6 @@ phase_directories() {
     run_privileged install -d -m 0755 "/etc/be-BOP/${TENANT_ID}"
     if [[ "$ENABLE_PHOENIXD" == "true" ]]; then
         run_privileged install -d -m 0755 "/etc/phoenixd/${TENANT_ID}"
-        run_privileged install -d -m 0755 "/var/lib/phoenixd/${TENANT_ID}"
     fi
     txn_register_undo "tenant directory tree" \
         "run_privileged rm -rf '/var/lib/be-BOP/${TENANT_ID}' '/etc/be-BOP/${TENANT_ID}' '/etc/phoenixd/${TENANT_ID}' '/var/lib/phoenixd/${TENANT_ID}'"
