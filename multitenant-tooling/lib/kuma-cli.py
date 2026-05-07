@@ -34,7 +34,15 @@ import os
 import sys
 
 try:
-    from uptime_kuma_api import UptimeKumaApi, MonitorType, NotificationType
+    from uptime_kuma_api import UptimeKumaApi, MonitorType
+    # NotificationType is optional — older lib versions don't expose
+    # every Kuma provider as an enum value (Zulip is missing in some).
+    # We pass the type as a plain string when the enum entry isn't
+    # available, which Kuma accepts identically.
+    try:
+        from uptime_kuma_api import NotificationType
+    except ImportError:
+        NotificationType = None
 except ImportError:
     print(
         "kuma-cli: uptime_kuma_api not installed; "
@@ -149,6 +157,14 @@ def cmd_setup_notifications(args):
         smtp_host = os.environ.get("SMTP_HOST", "").strip()
         smtp_to = os.environ.get("SMTP_TO", "").strip()
         smtp_from = os.environ.get("SMTP_FROM", "").strip()
+        # Resolve a NotificationType that's safe across lib versions.
+        # Pass the enum if available, otherwise fall back to the plain
+        # string Kuma uses internally — both are accepted server-side.
+        def nt(name_str):
+            if NotificationType is not None and hasattr(NotificationType, name_str.upper()):
+                return getattr(NotificationType, name_str.upper())
+            return name_str
+
         if smtp_host and smtp_to and smtp_from:
             name = "be-bop-smtp"
             if name in existing:
@@ -156,7 +172,7 @@ def cmd_setup_notifications(args):
             else:
                 api.add_notification(
                     name=name,
-                    type=NotificationType.SMTP,
+                    type=nt("smtp"),
                     isDefault=True,
                     applyExisting=True,
                     smtpHost=smtp_host,
@@ -182,7 +198,7 @@ def cmd_setup_notifications(args):
             else:
                 api.add_notification(
                     name=name,
-                    type=NotificationType.ZULIP,
+                    type=nt("zulip"),
                     isDefault=True,
                     applyExisting=True,
                     zulipBotEmail=zulip_email,
