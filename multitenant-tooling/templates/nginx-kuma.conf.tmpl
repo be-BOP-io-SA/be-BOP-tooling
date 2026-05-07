@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 be-bop.io contributors
+#
+# nginx vhost template for the host-wide Uptime Kuma UI, exposed
+# publicly at https://@kuma_hostname@/. Materialised at
+# /etc/nginx/sites-available/kuma.conf by host-bootstrap.sh when
+# KUMA_PUBLIC_HOSTNAME is set in secrets.env.
+#
+# Kuma carries its own auth (admin user provisioned by host-bootstrap),
+# so we don't add an extra nginx basic-auth layer. Critical bits:
+# Socket.IO needs the WebSocket upgrade headers + long read/send
+# timeouts; ssl_stapling intentionally omitted (Let's Encrypt no
+# longer publishes OCSP responder URLs).
+#
+# tooling-fingerprint: @template_revision@
+#
+# Substitution placeholders:
+#   @kuma_hostname@         e.g. kuma.pvh-labs.com
+#   @kuma_host_port@        local Kuma port (default 8810)
+#   @template_revision@     template fingerprint
+
+# --- HTTP -> HTTPS redirect --------------------------------------------------
+server {
+    listen 80;
+    listen [::]:80;
+    server_name @kuma_hostname@;
+
+    location / {
+        return 307 https://$host$request_uri;
+    }
+}
+
+# --- HTTPS Kuma reverse proxy ------------------------------------------------
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name @kuma_hostname@;
+
+    ssl_certificate     /etc/letsencrypt/live/kuma-host/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/kuma-host/privkey.pem;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ecdh_curve X25519:prime256v1:secp384r1;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-CHACHA20-POLY1305;
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:SSL-kuma:10m;
+    ssl_session_tickets off;
+    ssl_prefer_server_ciphers off;
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    location / {
+        proxy_pass http://127.0.0.1:@kuma_host_port@;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $server_name;
+        proxy_redirect off;
+        # Kuma is built on Socket.IO; the upgrade headers + long
+        # timeouts are required for the live status / charts.
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;
+        client_max_body_size 50M;
+    }
+}

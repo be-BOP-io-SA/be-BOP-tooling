@@ -1,0 +1,120 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 be-bop.io contributors
+#
+# Per-tenant nginx vhost template — managed by be-BOP multi-tenant tooling.
+# tooling-fingerprint: @template_revision@
+#
+# Materialised at /etc/nginx/sites-available/bebop-@tenant_id@.conf by
+# add-tenant.sh after the per-tenant Let's Encrypt cert (named bebop-@tenant_id@,
+# covering both @domain@ and @s3_domain@) has been issued.
+#
+# Substitution placeholders (all replaced by add-tenant.sh):
+#   @tenant_id@         tenant slug
+#   @domain@            <tenant>.<zone>           (be-BOP frontend)
+#   @s3_domain@         s3.<tenant>.<zone>        (Garage S3 endpoint)
+#   @bebop_port@        local be-BOP port
+#   @template_revision@ template fingerprint
+
+# --- HTTP -> HTTPS redirect for both names -----------------------------------
+server {
+    listen 80;
+    listen [::]:80;
+    server_name @domain@ @s3_domain@;
+
+    location / {
+        return 307 https://$host$request_uri;
+    }
+}
+
+# --- be-BOP frontend ----------------------------------------------------------
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name @domain@;
+
+    ssl_certificate     /etc/letsencrypt/live/bebop-@tenant_id@/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/bebop-@tenant_id@/privkey.pem;
+
+    # Mozilla "Intermediate" SSL configuration
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ecdh_curve X25519:prime256v1:secp384r1;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-CHACHA20-POLY1305;
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:SSL-bebop-@tenant_id@:10m;
+    ssl_session_tickets off;
+    ssl_prefer_server_ciphers off;
+    # OCSP stapling intentionally disabled: Let's Encrypt stopped including
+    # OCSP responder URLs in their certs in 2025; ssl_stapling on; would
+    # log a benign-but-noisy warning per nginx reload. Modern PKI is
+    # moving to CRLite / browser-side checks anyway.
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    proxy_set_header "Connection" "";
+
+    # SSE endpoints — long-lived connections for real-time sync
+    location ~ /sse$ {
+        proxy_pass http://127.0.0.1:@bebop_port@;
+        proxy_read_timeout 86400s;
+        proxy_send_timeout 86400s;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_set_header Connection '';
+        proxy_http_version 1.1;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header Host $http_host;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:@bebop_port@;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $server_name;
+        proxy_redirect off;
+    }
+}
+
+# --- Garage S3 endpoint for this tenant --------------------------------------
+# Garage itself binds 127.0.0.1:3900 and never exposes a public socket; nginx
+# is the only public face. Cross-tenant isolation is enforced by per-tenant
+# Garage access keys (each key only has read/write/owner on its own bucket).
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name @s3_domain@;
+
+    ssl_certificate     /etc/letsencrypt/live/bebop-@tenant_id@/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/bebop-@tenant_id@/privkey.pem;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ecdh_curve X25519:prime256v1:secp384r1;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-CHACHA20-POLY1305;
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:SSL-bebop-@tenant_id@-s3:10m;
+    ssl_session_tickets off;
+    ssl_prefer_server_ciphers off;
+    # OCSP stapling intentionally disabled: Let's Encrypt stopped including
+    # OCSP responder URLs in their certs in 2025; ssl_stapling on; would
+    # log a benign-but-noisy warning per nginx reload. Modern PKI is
+    # moving to CRLite / browser-side checks anyway.
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    client_max_body_size 1000M;
+    proxy_set_header "Connection" "";
+
+    location / {
+        proxy_pass http://127.0.0.1:3900;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $server_name;
+        proxy_redirect off;
+        proxy_connect_timeout 300;
+        proxy_http_version 1.1;
+        chunked_transfer_encoding off;
+    }
+}

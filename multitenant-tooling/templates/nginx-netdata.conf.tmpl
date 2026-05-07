@@ -1,0 +1,64 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright (C) 2026 be-bop.io contributors
+#
+# nginx vhost template for the host-wide Netdata UI, exposed publicly
+# at https://@netdata_hostname@/ behind HTTP basic auth. Materialised
+# at /etc/nginx/sites-available/netdata.conf by host-bootstrap.sh
+# when NETDATA_PUBLIC_HOSTNAME is set in secrets.env.
+#
+# tooling-fingerprint: @template_revision@
+#
+# Substitution placeholders:
+#   @netdata_hostname@      e.g. netdata.pvh-labs.com
+#   @template_revision@     template fingerprint
+
+# --- HTTP -> HTTPS redirect --------------------------------------------------
+server {
+    listen 80;
+    listen [::]:80;
+    server_name @netdata_hostname@;
+
+    location / {
+        return 307 https://$host$request_uri;
+    }
+}
+
+# --- HTTPS Netdata reverse proxy with basic auth -----------------------------
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name @netdata_hostname@;
+
+    ssl_certificate     /etc/letsencrypt/live/netdata-host/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/netdata-host/privkey.pem;
+
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ecdh_curve X25519:prime256v1:secp384r1;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384:DHE-RSA-CHACHA20-POLY1305;
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:SSL-netdata:10m;
+    ssl_session_tickets off;
+    ssl_prefer_server_ciphers off;
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    auth_basic "Netdata host metrics — be-BOP tooling";
+    auth_basic_user_file /etc/nginx/.netdata-htpasswd;
+
+    location / {
+        proxy_pass http://127.0.0.1:19999;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Forwarded-Host $server_name;
+        proxy_redirect off;
+        # Netdata uses WebSocket / SSE for real-time charts.
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 3600s;
+        proxy_send_timeout 3600s;
+        proxy_buffering off;
+    }
+}
