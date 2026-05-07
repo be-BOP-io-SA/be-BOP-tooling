@@ -60,6 +60,16 @@ source "$BEBOP_TOOLING_LIB_DIR/release.sh"
 # === Constants ==========================================================
 readonly TENANT_REGEX='^[a-z0-9][a-z0-9-]*$'
 readonly TENANT_MAX_LEN=32
+# Subdomains used by host-level infrastructure (Netdata UI, future Kuma
+# / Grafana exposure, the s3.* pattern for tenant Garage endpoints, and
+# common conventional names). A tenant_id matching any of these would
+# collide with an existing or planned vhost/cert/DNS record.
+readonly RESERVED_TENANT_IDS=(
+    netdata kuma grafana monitoring metrics status
+    s3 garage www admin api mail mx ns dns
+    root system bebop phoenixd mongod
+    dashboard panel saas ops
+)
 readonly DEFAULT_BUCKET_QUOTA="20GiB"
 readonly TEMPLATE_REVISION="2026050501"
 readonly HEALTHCHECK_RETRIES=15
@@ -144,6 +154,12 @@ fi
 if (( ${#TENANT_ID} > TENANT_MAX_LEN )); then
     die "tenant_id too long (max ${TENANT_MAX_LEN}): '${TENANT_ID}'"
 fi
+for _reserved in "${RESERVED_TENANT_IDS[@]}"; do
+    if [[ "$TENANT_ID" == "$_reserved" ]]; then
+        die "tenant_id '${TENANT_ID}' is reserved (collides with host-level infrastructure subdomains; see RESERVED_TENANT_IDS in add-tenant.sh)"
+    fi
+done
+unset _reserved
 
 # Tag log lines with the tenant id from now on.
 BEBOP_TOOLING_TENANT_ID="$TENANT_ID"
