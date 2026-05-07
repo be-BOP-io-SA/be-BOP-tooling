@@ -547,6 +547,12 @@ phase_certificate() {
         # source-tree layout (running from a checkout)
         hooks_dir="${SCRIPT_DIR}/hooks"
     fi
+    # Prefer the fleet-wide LE_OPERATOR_EMAIL so every cert lives under
+    # one Let's Encrypt account; fall back to the per-tenant ADMIN_EMAIL
+    # for backward compat. Using ADMIN_EMAIL means a new LE account per
+    # tenant, which trips LE's "10 accounts / IP / 3h" limit on bulk
+    # onboarding — see secrets.env.example for the recommended setup.
+    local acme_email="${LE_OPERATOR_EMAIL:-$ADMIN_EMAIL}"
     local certbot_args=(
         certonly
         --manual
@@ -554,7 +560,7 @@ phase_certificate() {
         --manual-auth-hook "${hooks_dir}/certbot-ovh-auth.sh"
         --manual-cleanup-hook "${hooks_dir}/certbot-ovh-cleanup.sh"
         --non-interactive --agree-tos
-        --email "$ADMIN_EMAIL"
+        --email "$acme_email"
         --cert-name "$CERT_NAME"
         -d "$DOMAIN"
         -d "$S3_DOMAIN"
