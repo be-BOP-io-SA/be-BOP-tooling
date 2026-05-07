@@ -901,6 +901,92 @@ EOF
     log_info "Netdata public access ready at https://${hostname}/ (creds in ${admin_file})"
 }
 
+# === Kuma public reverse-proxy (optional, opt-in via secrets.env) =======
+# When KUMA_PUBLIC_HOSTNAME is set, expose the Uptime Kuma UI publicly
+# behind nginx + Let's Encrypt. No extra basic-auth — Kuma has its own
+# admin login (auto-provisioned at /etc/be-BOP-tooling/kuma-admin.env).
+step_setup_kuma_public_access() {
+    if [[ -z "${KUMA_PUBLIC_HOSTNAME:-}" ]]; then
+        log_info "KUMA_PUBLIC_HOSTNAME unset — Kuma stays local-only (SSH tunnel for access)"
+        return 0
+    fi
+    if [[ "$DEFER_SECRETS" == "true" && -z "${OVH_APPLICATION_KEY:-}" ]]; then
+        log_info "Skipping Kuma public access (--defer-secrets)"
+        return 0
+    fi
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log_info "[dry-run] would expose Kuma at https://${KUMA_PUBLIC_HOSTNAME}/"
+        return 0
+    fi
+    local zone="${OVH_DNS_ZONE:-}"
+    local hostname="$KUMA_PUBLIC_HOSTNAME"
+    if [[ -z "$zone" ]]; then
+        die "KUMA_PUBLIC_HOSTNAME set but OVH_DNS_ZONE is empty"
+    fi
+    if [[ "$hostname" != *".${zone}" ]]; then
+        die "KUMA_PUBLIC_HOSTNAME=${hostname} must be within OVH_DNS_ZONE=${zone}"
+    fi
+    local sub="${hostname%.${zone}}"
+
+    # 1. DNS A record (idempotent).
+    local host_ip="${BEBOP_HOST_IP:-}"
+    if [[ -z "$host_ip" ]]; then
+        host_ip=$(curl -sS --max-time 10 https://api.ipify.org 2>/dev/null || true)
+    fi
+    if [[ -z "$host_ip" || ! "$host_ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]]; then
+        die "could not detect host public IP (set BEBOP_HOST_IP in env to override)"
+    fi
+    log_info "Ensuring DNS A record ${hostname} -> ${host_ip}..."
+    ovh_dns_record_create "$sub" A "$host_ip" >/dev/null
+    ovh_dns_zone_refresh
+
+    # 2. TLS cert (single-domain, via certbot --manual + our hooks).
+    if run_privileged test -d /etc/letsencrypt/live/kuma-host; then
+        log_info "Cert kuma-host already issued ✓"
+    else
+        local acme_email="${LE_OPERATOR_EMAIL:-${ADMIN_EMAIL:-}}"
+        if [[ -z "$acme_email" ]]; then
+            log_warn "No LE_OPERATOR_EMAIL (or ADMIN_EMAIL) — Kuma cert NOT issued"
+            log_warn "Set LE_OPERATOR_EMAIL in secrets.env and re-run this script to finish"
+            return 0
+        fi
+        local hooks_dir="${SCRIPT_DIR}/hooks"
+        if [[ ! -d "$hooks_dir" ]]; then
+            hooks_dir="${BEBOP_TOOLING_INSTALL_PREFIX}/hooks"
+        fi
+        log_info "Issuing Let's Encrypt cert for ${hostname} (DNS-01 via OVH hooks)..."
+        run_privileged certbot certonly \
+            --manual \
+            --preferred-challenges dns-01 \
+            --manual-auth-hook "${hooks_dir}/certbot-ovh-auth.sh" \
+            --manual-cleanup-hook "${hooks_dir}/certbot-ovh-cleanup.sh" \
+            --non-interactive --agree-tos \
+            --email "$acme_email" \
+            --cert-name kuma-host \
+            -d "$hostname"
+    fi
+
+    # 3. nginx vhost.
+    log_info "Installing nginx vhost for ${hostname}..."
+    local tmpl="${BEBOP_TOOLING_TEMPLATE_DIR}/nginx-kuma.conf.tmpl"
+    local rev="2026050601"
+    local tmp
+    tmp=$(mktemp)
+    sed -e "s|@kuma_hostname@|${hostname}|g" \
+        -e "s|@kuma_host_port@|${UPTIME_KUMA_HOST_PORT}|g" \
+        -e "s|@template_revision@|${rev}|g" \
+        "$tmpl" > "$tmp"
+    run_privileged install -m 0644 "$tmp" /etc/nginx/sites-available/kuma.conf
+    run_privileged ln -sfn /etc/nginx/sites-available/kuma.conf /etc/nginx/sites-enabled/kuma.conf
+    rm -f "$tmp"
+
+    if ! run_privileged nginx -t 2>/dev/null; then
+        die "nginx -t failed after installing the kuma vhost"
+    fi
+    run_privileged systemctl reload nginx
+    log_info "Kuma public access ready at https://${hostname}/ (login with creds in /etc/be-BOP-tooling/kuma-admin.env)"
+}
+
 # === Summary ===========================================================
 step_print_summary() {
     local title="be-BOP multi-tenant host bootstrap COMPLETE"
@@ -1003,6 +1089,7 @@ main() {
     step_setup_kuma_notifications
     step_install_netdata
     step_setup_netdata_public_access
+    step_setup_kuma_public_access
 
     step_print_summary
 }
