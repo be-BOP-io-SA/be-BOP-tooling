@@ -108,6 +108,7 @@ chmod 0755 \
     "${INSTALL_DIR}/remove-tenant.sh" \
     "${INSTALL_DIR}/upgrade-tenant.sh" \
     "${INSTALL_DIR}/upgrade-all.sh" \
+    "${INSTALL_DIR}/list-tenants.sh" \
     "${INSTALL_DIR}/install.sh" 2>/dev/null || true
 
 # 4. Reconcile secrets.env: fresh / reset / resume.

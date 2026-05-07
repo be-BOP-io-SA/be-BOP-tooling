@@ -620,7 +620,7 @@ step_install_tooling_libs_and_scripts() {
     fi
     log_info "Installing per-tenant scripts to /usr/local/bin/..."
     local script
-    for script in add-tenant.sh remove-tenant.sh upgrade-tenant.sh upgrade-all.sh; do
+    for script in add-tenant.sh remove-tenant.sh upgrade-tenant.sh upgrade-all.sh list-tenants.sh; do
         if [[ -f "${SCRIPT_DIR}/${script}" ]]; then
             maybe_run run_privileged install -m 0755 "${SCRIPT_DIR}/${script}" "/usr/local/bin/${script}"
         else
