@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.5.13"
+readonly SCRIPT_VERSION="2.5.14"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -2339,6 +2339,35 @@ provision_ssl_cert() {
     fi
 }
 
+# Point the stow target at a package, retiring any other version first.
+#
+# `stow <new>` does not switch versions. The symlinks under /usr/local
+# belong to the package stowed previously; stow leaves them alone rather
+# than take them over. The new binary then sits unused in its package
+# directory while everything keeps executing the old one — and since the
+# command itself doesn't fail, the upgrade looks successful.
+#
+# Observed on a 0.6.2 -> 0.9.1 bump: /usr/local/bin/phoenixd still
+# resolved to 0.6.2 after a clean re-run.
+#
+# Arguments: $1 stow directory, $2 package name to activate.
+stow_switch() {
+    local STOW_DIR="$1"
+    local PACKAGE="$2"
+    local OTHER
+
+    pushd "$STOW_DIR" > /dev/null
+    for OTHER in */; do
+        OTHER="${OTHER%/}"
+        [[ -d "$OTHER" ]] || continue
+        [[ "$OTHER" == "$PACKAGE" ]] && continue
+        log_info "Retiring previously stowed package ${OTHER}"
+        run_privileged stow --delete "$OTHER" || true
+    done
+    run_privileged stow --restow "$PACKAGE"
+    popd > /dev/null
+}
+
 install_phoenixd() {
     log_info "Installing phoenixd Lightning Network daemon..."
 
@@ -2394,9 +2423,7 @@ install_phoenixd() {
     fi
 
     # Use stow to symlink the binary
-    pushd "$STOW_DIR" > /dev/null
-    run_privileged stow "phoenixd-${PHOENIXD_VERSION}"
-    popd > /dev/null
+    stow_switch "$STOW_DIR" "phoenixd-${PHOENIXD_VERSION}"
     log_info "phoenixd ${PHOENIXD_VERSION} installed using stow"
 }
 
@@ -2552,9 +2579,7 @@ install_garage() {
     fi
 
     # Use stow to symlink the binary
-    pushd "$STOW_DIR" > /dev/null
-    run_privileged stow "garage-v${GARAGE_VERSION}"
-    popd > /dev/null
+    stow_switch "$STOW_DIR" "garage-v${GARAGE_VERSION}"
     log_info "Garage v${GARAGE_VERSION} installed using stow"
 }
 
