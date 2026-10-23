@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.5.13"
+readonly SCRIPT_VERSION="2.5.14"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -729,10 +729,20 @@ inspect_system_state() {
     fi
 
     # Check installed packages
+    # The fact means "the expected major is installed", not "some node is
+    # present". It used to be set on the mere existence of the binary, with
+    # the version read, logged at debug level and discarded. A host that
+    # already had Node therefore skipped both the repository configuration
+    # and the install, so a change of NODEJS_MAJOR_VERSION never reached it
+    # — and the run still reported success.
     if command -v node >/dev/null 2>&1; then
         local node_version=$(node --version | sed 's/v//')
         log_debug "Found Node.js version: $node_version"
-        SYSTEM_STATE+=("nodejs_available")
+        if [[ "${node_version%%.*}" == "$NODEJS_MAJOR_VERSION" ]]; then
+            SYSTEM_STATE+=("nodejs_available")
+        else
+            log_info "Node.js v${node_version} is installed, v${NODEJS_MAJOR_VERSION} is expected — it will be replaced"
+        fi
     fi
 
     if [[ -f /etc/apt/sources.list.d/mongodb-org-${MONGODB_VERSION}.list ]]; then
@@ -1260,10 +1270,10 @@ plan_setup_tasks() {
 
     # Smart cascading logic for Node.js
     if ! has_fact "nodejs_available"; then
-        # Only configure repo if Node.js is not already installed
-        if ! has_fact "nodejs_repo_configured"; then
-            TASK_PLAN+=("configure_nodejs_repo")
-        fi
+        # The repository is repointed here even when nodesource.list already
+        # exists. That file names a major, and when it names the previous one
+        # keeping it would reinstall the very version we are leaving.
+        TASK_PLAN+=("configure_nodejs_repo")
         TASK_PLAN+=("install_nodejs")
     fi
 
