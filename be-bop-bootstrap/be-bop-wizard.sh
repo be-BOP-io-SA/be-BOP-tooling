@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.5.12"
+readonly SCRIPT_VERSION="2.5.13"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -72,7 +72,7 @@ readonly SERVICE_TEST_START_WAIT_SECONDS=3
 # a newer version is already installed.
 readonly NODEJS_MAJOR_VERSION=22
 readonly MONGODB_VERSION="8.0"
-readonly PHOENIXD_VERSION="0.6.2"
+readonly PHOENIXD_VERSION="0.9.1"
 readonly GARAGE_VERSION="2.2.0"
 
 # Error trap handler
