@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.5.14"
+readonly SCRIPT_VERSION="2.5.15"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -70,7 +70,7 @@ readonly SERVICE_TEST_START_WAIT_SECONDS=3
 # and prefer the newer version, possibly remove the previous version while keeping the
 # script “safe”: For example, the previous version repositories can only be removed if
 # a newer version is already installed.
-readonly NODEJS_MAJOR_VERSION=22
+readonly NODEJS_MAJOR_VERSION=24
 readonly MONGODB_VERSION="8.0"
 readonly PHOENIXD_VERSION="0.9.1"
 readonly GARAGE_VERSION="2.2.0"
