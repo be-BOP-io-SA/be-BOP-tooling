@@ -29,7 +29,7 @@ jobs:
 
           # Check wizard script versions
           echo "Checking SCRIPT_VERSION updates in commits that updated $wizard_file"
-          for ref in $(git rev-list ${{ github.event.pull_request.base.ref }}..HEAD | tac); do
+          for ref in $(git rev-list --no-merges ${{ github.event.pull_request.base.ref }}..HEAD | tac); do
             if [[ -n "$(git show "$ref" "$wizard_file" 2>/dev/null || true)" ]]; then
               version="$(git show "$ref" "$wizard_file" | grep -oP '^\+readonly SCRIPT_VERSION="\K[^"]+' || true)"
               if [[ -n "$version" ]]; then
@@ -45,7 +45,7 @@ jobs:
 
           # Check CLI script versions
           echo "Checking SCRIPT_VERSION updates in commits that updated $cli_file"
-          for ref in $(git rev-list ${{ github.event.pull_request.base.ref }}..HEAD | tac); do
+          for ref in $(git rev-list --no-merges ${{ github.event.pull_request.base.ref }}..HEAD | tac); do
             if [[ -n "$(git show "$ref" "$cli_file" 2>/dev/null || true)" ]]; then
               version="$(git show "$ref" "$cli_file" | grep -oP '^\+readonly SCRIPT_VERSION="\K[^"]+' || true)"
               if [[ -n "$version" ]]; then
