@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.5.15"
+readonly SCRIPT_VERSION="2.5.16"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -1343,7 +1343,7 @@ plan_setup_tasks() {
             if ! has_fact "nginx_running"; then
                 TASK_PLAN+=("start_and_enable_nginx")
             else
-                TASK_PLAN+=("reload_nginx")
+                TASK_PLAN+=("restart_nginx")
             fi
         fi
 
@@ -1357,7 +1357,7 @@ plan_setup_tasks() {
     if has_fact nginx_config_fingerprint && \
        [[ "$(get_fact nginx_config_fingerprint)" != "$(wizard_file_fingerprint nginx_config)" ]]; then
         [[ ! "${TASK_PLAN[*]}" =~ configure_bebop_site ]] && TASK_PLAN+=("configure_bebop_site")
-        has_fact nginx_running && TASK_PLAN+=("reload_nginx")
+        has_fact nginx_running && TASK_PLAN+=("restart_nginx")
         local domain
         if domain="$(get_fact "specified_domain")" && [[ "$domain" != "localhost" ]]; then
             [[ ! "${TASK_PLAN[*]}" =~ provision_ssl_cert ]] && TASK_PLAN+=("provision_ssl_cert")
@@ -1810,7 +1810,7 @@ task_requires_systemd_operational() {
         install_garage_service) ;;
         install_phoenixd_service) ;;
         provision_garage) ;;
-        reload_nginx) ;;
+        restart_nginx) ;;
         restart_bebop) ;;
         restart_garage) ;;
         start_and_enable_bebop) ;;
@@ -1897,7 +1897,7 @@ describe_task() {
         "migrate_minio_to_garage") echo "Migrate data from MinIO to Garage" ;;
         "provision_garage") echo "Provision Garage storage (layout, key, bucket)" ;;
         "provision_ssl_cert") echo "Provision SSL certificate with Let's Encrypt" ;;
-        "reload_nginx") echo "Reload nginx configuration" ;;
+        "restart_nginx") echo "Restart nginx with its new configuration" ;;
         "restart_bebop") echo "Restart be-BOP service" ;;
         "restart_garage") echo "Restart Garage service" ;;
         "setup_bebop_directory_permissions") echo "Set up be-BOP directory permissions" ;;
@@ -1946,7 +1946,7 @@ run_task() {
         "migrate_minio_to_garage") migrate_minio_to_garage ;;
         "provision_garage") provision_garage ;;
         "provision_ssl_cert") provision_ssl_cert ;;
-        "reload_nginx") reload_nginx ;;
+        "restart_nginx") restart_nginx ;;
         "restart_bebop") restart_bebop ;;
         "restart_garage") restart_garage ;;
         "setup_bebop_directory_permissions") setup_bebop_directory_permissions ;;
@@ -2333,10 +2333,11 @@ start_and_enable_nginx() {
     run_privileged systemctl start nginx
 }
 
-reload_nginx() {
-    log_info "Reloading nginx configuration..."
+# Not a reload: former workers would keep serving open connections, up to a day on /sse, as configured before.
+restart_nginx() {
+    log_info "Restarting nginx with its new configuration..."
     run_privileged nginx -t
-    run_privileged systemctl reload nginx
+    run_privileged systemctl restart nginx
 }
 
 provision_ssl_cert() {
