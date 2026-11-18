@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.5.16"
+readonly SCRIPT_VERSION="2.5.17"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -631,6 +631,11 @@ inspect_system_state() {
 
     if [[ -n "${EMAIL:-}" ]]; then
         SYSTEM_STATE+=("specified_email=${EMAIL}")
+    fi
+
+    # Recent certbot keeps no email in its account files, so a host that has an account needs none.
+    if run_privileged find /etc/letsencrypt/accounts -name regr.json -print -quit 2>/dev/null | grep -q .; then
+        SYSTEM_STATE+=("letsencrypt_account_exists")
     fi
 
     # Compute derived domain facts
@@ -1456,7 +1461,7 @@ check_options_required_by_planned_tasks_but_missing() {
                     REQUIRED_OPTIONS+=("domain")
                     TASKS_REQUIRING_OPTIONS+=("$task")
                 fi
-                if ! has_fact "specified_email"; then
+                if ! has_fact "specified_email" && ! has_fact "letsencrypt_account_exists"; then
                     REQUIRED_OPTIONS+=("email")
                     TASKS_REQUIRING_OPTIONS+=("$task")
                 fi
@@ -2349,11 +2354,14 @@ provision_ssl_cert() {
     local certbot_args=(
         "--agree-tos"
         "--cert-name" "${main_domain}"
-        "--email" "${email}"
         "--nginx"
         "--non-interactive"
         "--reinstall"
     )
+    # Only registering an account needs one; certbot reuses the account already on the host.
+    if [[ -n "$email" ]]; then
+        certbot_args+=("--email" "${email}")
+    fi
     for d in $domains; do
         certbot_args+=(-d "$d")
     done
