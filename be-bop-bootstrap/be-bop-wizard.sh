@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.5.14"
+readonly SCRIPT_VERSION="2.5.15"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -573,7 +573,7 @@ wizard_file_fingerprint() {
     local template_rev
     case "${1:-bebop_config}" in
         bebop_config) template_rev="2026022302" ;;
-        nginx_config) template_rev="2026031901" ;;
+        nginx_config) template_rev="2026111801" ;;
         bebop_cli_wrapper) template_rev="2026010601" ;;
         bebop_cli_sudoers) template_rev="2026010601" ;;
     esac
@@ -2178,19 +2178,34 @@ EOF
         # Production configuration with HTTPS
         local all_domains="$(domains_for_nginx)"
 
+        # A shop keeps its certificate while certbot runs again: a self-signed one locks out visitors under HSTS.
+        local cert_dir
+        cert_dir="/etc/letsencrypt/live/$(get_fact bebop_domain)"
+        local ssl_cert="/etc/ssl/certs/ssl-cert-snakeoil.pem"
+        local ssl_key="/etc/ssl/private/ssl-cert-snakeoil.key"
+        if run_privileged test -f "$cert_dir/fullchain.pem" && run_privileged test -f "$cert_dir/privkey.pem"; then
+            ssl_cert="$cert_dir/fullchain.pem"
+            ssl_key="$cert_dir/privkey.pem"
+        fi
+
         awk -v all_doms="$all_domains" \
             -v main_dom="$domain" \
             -v s3_dom="$(get_fact s3_domain)" \
+            -v cert="$ssl_cert" \
+            -v key="$ssl_key" \
             -v fp="$(wizard_file_fingerprint nginx_config)" \
             '{
                 gsub(/@http_to_https_domains@/, all_doms)
                 gsub(/@main_domain@/, main_dom)
                 gsub(/@s3_domain@/, s3_dom)
+                gsub(/@ssl_certificate@/, cert)
+                gsub(/@ssl_certificate_key@/, key)
                 gsub(/@file_fingerprint@/, fp)
                 print
             }' > "$TMPDIR/be-BOP.conf" << 'EOF'
 # The sites in this file are managed by be-bop-wizard
 # wizard-fingerprint: @file_fingerprint@
+# HTTP/2 stays off until the distributions ship nginx with the fixes of CVE-2026-123633 and CVE-2026-123007.
 
 server {
     listen 80;
@@ -2203,12 +2218,12 @@ server {
 }
 
 server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+    listen 443 ssl;
+    listen [::]:443 ssl;
     server_name @main_domain@;
 
-    ssl_certificate     /etc/ssl/certs/ssl-cert-snakeoil.pem;
-    ssl_certificate_key /etc/ssl/private/ssl-cert-snakeoil.key;
+    ssl_certificate     @ssl_certificate@;
+    ssl_certificate_key @ssl_certificate_key@;
 
     # Mozilla's "Intermediate" SSL configuration
     ssl_protocols TLSv1.2 TLSv1.3;
@@ -2247,12 +2262,12 @@ server {
 }
 
 server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+    listen 443 ssl;
+    listen [::]:443 ssl;
     server_name @s3_domain@;
 
-    ssl_certificate     /etc/ssl/certs/ssl-cert-snakeoil.pem;
-    ssl_certificate_key /etc/ssl/private/ssl-cert-snakeoil.key;
+    ssl_certificate     @ssl_certificate@;
+    ssl_certificate_key @ssl_certificate_key@;
 
     # Mozilla's "Intermediate" SSL configuration
     ssl_protocols TLSv1.2 TLSv1.3;
@@ -2289,11 +2304,11 @@ EOF
             cat >> "$TMPDIR/be-BOP.conf" << EOF
 
 server {
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+    listen 443 ssl;
+    listen [::]:443 ssl;
     server_name ${redir};
-    ssl_certificate     /etc/ssl/certs/ssl-cert-snakeoil.pem;
-    ssl_certificate_key /etc/ssl/private/ssl-cert-snakeoil.key;
+    ssl_certificate     ${ssl_cert};
+    ssl_certificate_key ${ssl_key};
     return 307 https://${domain}\$request_uri;
 }
 EOF
