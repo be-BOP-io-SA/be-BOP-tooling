@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.5.18"
+readonly SCRIPT_VERSION="2.5.19"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -2335,7 +2335,8 @@ EOF
 start_and_enable_nginx() {
     log_info "Starting and enabling nginx service..."
     run_privileged systemctl enable nginx
-    run_privileged systemctl start nginx
+    # Installing the package already starts nginx with its default site, which a plain start would keep.
+    run_privileged systemctl restart nginx
 }
 
 # Not a reload: former workers would keep serving open connections, up to a day on /sse, as configured before.
