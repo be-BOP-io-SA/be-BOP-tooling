@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.5.17"
+readonly SCRIPT_VERSION="2.5.18"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -2347,7 +2347,7 @@ restart_nginx() {
 
 provision_ssl_cert() {
     log_info "Provisioning SSL certificate with Let's Encrypt..."
-    local email="$(get_fact "specified_email")"
+    local email="$(get_fact "specified_email" || true)"
     local main_domain="$(get_fact bebop_domain)"
     local domains="$(domains_for_nginx)"
 
