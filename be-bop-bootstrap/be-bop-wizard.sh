@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.5.21"
+readonly SCRIPT_VERSION="2.5.22"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -580,7 +580,7 @@ wizard_file_fingerprint() {
     local template_rev
     case "${1:-bebop_config}" in
         bebop_config) template_rev="2026111801" ;;
-        nginx_config) template_rev="2026111801" ;;
+        nginx_config) template_rev="2026111802" ;;
         bebop_cli_wrapper) template_rev="2026010601" ;;
         bebop_cli_sudoers) template_rev="2026010601" ;;
     esac
@@ -2137,6 +2137,7 @@ server {
     listen 80;
     listen [::]:80;
     server_name localhost;
+    server_tokens off;
 
     proxy_set_header "Connection" "";
 
@@ -2154,7 +2155,7 @@ server {
     }
 
     location / {
-        proxy_pass http://localhost:3000;
+        proxy_pass http://127.0.0.1:3000;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -2168,12 +2169,15 @@ server {
     listen 80;
     listen [::]:80;
     server_name s3.localhost;
+    server_tokens off;
 
     proxy_set_header "Connection" "";
     client_max_body_size 1000M;
+    # Garage checks the signature of an upload from its headers; nginx no longer stores the body first.
+    proxy_request_buffering off;
 
     location / {
-        proxy_pass http://localhost:3900;
+        proxy_pass http://127.0.0.1:3900;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -2223,6 +2227,7 @@ server {
     listen 80;
     listen [::]:80;
     server_name @http_to_https_domains@;
+    server_tokens off;
 
     location / {
         return 307 https://$host$request_uri;
@@ -2233,6 +2238,7 @@ server {
     listen 443 ssl;
     listen [::]:443 ssl;
     server_name @main_domain@;
+    server_tokens off;
 
     ssl_certificate     @ssl_certificate@;
     ssl_certificate_key @ssl_certificate_key@;
@@ -2263,7 +2269,7 @@ server {
     }
 
     location / {
-        proxy_pass http://localhost:3000;
+        proxy_pass http://127.0.0.1:3000;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -2277,6 +2283,7 @@ server {
     listen 443 ssl;
     listen [::]:443 ssl;
     server_name @s3_domain@;
+    server_tokens off;
 
     ssl_certificate     @ssl_certificate@;
     ssl_certificate_key @ssl_certificate_key@;
@@ -2294,9 +2301,11 @@ server {
     proxy_set_header "Connection" "";
 
     client_max_body_size 1000M;
+    # Garage checks the signature of an upload from its headers; nginx no longer stores the body first.
+    proxy_request_buffering off;
 
     location / {
-        proxy_pass http://localhost:3900;
+        proxy_pass http://127.0.0.1:3900;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
@@ -2319,6 +2328,7 @@ server {
     listen 443 ssl;
     listen [::]:443 ssl;
     server_name ${redir};
+    server_tokens off;
     ssl_certificate     ${ssl_cert};
     ssl_certificate_key ${ssl_key};
     return 307 https://${domain}\$request_uri;
