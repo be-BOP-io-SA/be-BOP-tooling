@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.5.22"
+readonly SCRIPT_VERSION="2.5.23"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -74,6 +74,17 @@ readonly NODEJS_MAJOR_VERSION=24
 readonly MONGODB_VERSION="8.0"
 readonly PHOENIXD_VERSION="0.9.1"
 readonly GARAGE_VERSION="2.2.0"
+# SHA-256 of the downloads above, per Debian architecture: change them with the version.
+# phoenixd: the archives listed in the release's SHA256SUMS.asc.
+declare -rA PHOENIXD_SHA256=(
+    [amd64]="ccb4fcfb45f839481d12d9f9cdf3db1d4f69655f8ef6f569cb43b345ed5521ce"
+    [arm64]="4fe5bf480fbfb106c0e7b25cad6e369c48f07c129fc111c12f65357e350bc4bc"
+)
+# Garage: the binaries, identical to /garage in the dxflrs/garage image of the same version.
+declare -rA GARAGE_SHA256=(
+    [amd64]="ec761bb996e8453e86fe68ccc1cf222c73bb1ef05ae0b540bd4827e7d1931aab"
+    [arm64]="3922bd3524e5267587a27fec91e4d8447353113ea3a55e2d1786a53d7529d1da"
+)
 
 # Error trap handler
 die_unexpected_error_in_function() {
@@ -291,6 +302,14 @@ run_bebop_cli() {
         die $EXIT_ERROR $LINENO "be-bop-cli not found at /usr/local/bin/be-bop-cli"
     fi
     /usr/local/bin/be-bop-cli "$@"
+}
+
+verify_sha256() {
+    local file="$1" expected="$2" actual
+    actual="$(sha256sum "$file" | cut -d' ' -f1)"
+    if [[ -z "$expected" || "$actual" != "$expected" ]]; then
+        die $EXIT_ERROR $LINENO "Downloaded $file does not match its pinned SHA-256 (got $actual, expected ${expected:-none})"
+    fi
 }
 
 # Wrapper for consistent file management
@@ -2460,6 +2479,7 @@ install_phoenixd() {
             "--output" phoenixd.zip
         )
         curl "${curl_args[@]}" "$phoenixd_url"
+        verify_sha256 phoenixd.zip "${PHOENIXD_SHA256[$(get_fact "debian_arch")]:-}"
         unzip -q phoenixd.zip
 
         # Create stow directory structure
@@ -2615,6 +2635,7 @@ install_garage() {
             "--output" garage
         )
         curl "${curl_args[@]}" "$GARAGE_URL"
+        verify_sha256 garage "${GARAGE_SHA256[$(get_fact "debian_arch")]:-}"
 
         # Create stow directory structure
         run_privileged mkdir -p "$PACKAGE_DIR/bin"
