@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.5.23"
+readonly SCRIPT_VERSION="2.5.24"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -301,7 +301,8 @@ run_bebop_cli() {
     if [[ ! -f /usr/local/bin/be-bop-cli ]]; then
         die $EXIT_ERROR $LINENO "be-bop-cli not found at /usr/local/bin/be-bop-cli"
     fi
-    /usr/local/bin/be-bop-cli "$@"
+    # As the be-bop-cli account, so that even a launcher left by an older wizard never runs as root.
+    run_privileged runuser -u be-bop-cli -- /usr/local/bin/be-bop-cli "$@"
 }
 
 verify_sha256() {
@@ -600,7 +601,7 @@ wizard_file_fingerprint() {
     case "${1:-bebop_config}" in
         bebop_config) template_rev="2026111801" ;;
         nginx_config) template_rev="2026111802" ;;
-        bebop_cli_wrapper) template_rev="2026010601" ;;
+        bebop_cli_wrapper) template_rev="2026111901" ;;
         bebop_cli_sudoers) template_rev="2026010601" ;;
     esac
     if command -v sha256sum >/dev/null 2>&1; then
@@ -718,7 +719,6 @@ inspect_system_state() {
         "sha256sum"
         "stow"
         "sudo"
-        "tcc"
         "ucf"
         "unzip"
     )
@@ -730,7 +730,6 @@ inspect_system_state() {
     done
     local potential_packages=(
         "certbot"
-        "libc6-dev"
         "mongodb-org"
         "nginx"
         "python3-certbot-nginx"
@@ -895,7 +894,7 @@ inspect_system_state() {
 
         # Extract CLI version
         local cli_version_output
-        if cli_version_output=$(/usr/local/bin/be-bop-cli --version 2>/dev/null || true); then
+        if cli_version_output=$(run_bebop_cli --version 2>/dev/null || true); then
             local cli_version=$(echo "$cli_version_output" | awk '{print $2}' | sed 's/v//')
             if [[ -n "$cli_version" ]]; then
                 SYSTEM_STATE+=("bebop_cli_version=${cli_version}")
@@ -1569,7 +1568,7 @@ list_tools_for_task() {
         "configure_bebop_site") echo "curl nginx ssl-cert" ;;
         "configure_mongodb_repo") echo "curl gpg" ;;
         "configure_nodejs_repo") echo "curl gpg" ;;
-        "install_bebop_cli") echo "curl jq unzip sha256sum tcc" ;;
+        "install_bebop_cli") echo "curl jq unzip sha256sum" ;;
         "install_bebop_cli_sudoers") echo "sudo" ;;
         "install_garage") echo "curl stow" ;;
         "install_phoenixd") echo "curl unzip stow" ;;
@@ -1608,11 +1607,6 @@ collect_all_required_tools() {
                     ;;
                 "mongosh")
                     INSTALL_TOOLS+=("mongodb-mongosh")
-                    ;;
-                "tcc"|"gcc"|"cc")
-                    if ! has_tool gcc && ! has_tool tcc; then
-                        INSTALL_TOOLS+=("tcc" "libc6-dev")
-                    fi
                     ;;
                 "sha256sum")
                     INSTALL_TOOLS+=("coreutils")
@@ -2498,76 +2492,45 @@ install_phoenixd() {
     log_info "phoenixd ${PHOENIXD_VERSION} installed using stow"
 }
 
+# Both files belong to root: the be-bop-cli account runs them but can change neither, so nothing it
+# controls ever runs as root.
 install_bebop_cli() {
-    log_info "Installing be-BOP CLI with SUID wrapper..."
-
-    # Determine which compiler to use
-    local CC=""
-    if command -v tcc &>/dev/null; then
-        CC="tcc"
-    elif command -v gcc &>/dev/null; then
-        CC="gcc"
-    elif command -v cc &>/dev/null; then
-        CC="cc"
-    else
-        die $EXIT_ERROR $LINENO "No C compiler available (tried tcc, gcc, cc)."
-    fi
-    log_info "Using C compiler: $CC"
+    log_info "Installing be-BOP CLI..."
 
     # Get the directory where this wizard script is located
     local SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     local CLI_SCRIPT="$SCRIPT_DIR/be-bop-cli.sh"
-    local WRAPPER_TEMPLATE="$SCRIPT_DIR/be-bop-cli-wrapper.c"
 
     if [[ ! -f "$CLI_SCRIPT" ]]; then
         die $EXIT_ERROR $LINENO "Could not find be-bop-cli.sh in the same directory as this wizard"
     fi
 
-    if [[ ! -f "$WRAPPER_TEMPLATE" ]]; then
-        die $EXIT_ERROR $LINENO "Could not find be-bop-cli-wrapper.c in the same directory as this wizard"
-    fi
-
-    # Create directories
-    run_privileged mkdir -p /usr/local/libexec
-    run_privileged mkdir -p /usr/local/bin
-
-    # Install the real script
-    run_privileged cp "$CLI_SCRIPT" /usr/local/libexec/be-bop-cli.real
-    run_privileged chmod 755 /usr/local/libexec/be-bop-cli.real
-    run_privileged chown be-bop-cli:be-bop-cli /usr/local/libexec/be-bop-cli.real
-
-    # Calculate script size and hash
-    local SCRIPT_SIZE=$(stat -c %s /usr/local/libexec/be-bop-cli.real)
-    local SCRIPT_HASH=""
-    if command -v sha256sum &>/dev/null; then
-        SCRIPT_HASH=$(sha256sum /usr/local/libexec/be-bop-cli.real | cut -d' ' -f1)
-    else
-        die $EXIT_ERROR $LINENO "sha256sum tool is required but not available"
-    fi
-    local WRAPPER_FINGERPRINT=$(wizard_file_fingerprint "bebop_cli_wrapper")
-
-    # Create temporary directory for compilation
     local TMPDIR=$(mktemp -d)
     # shellcheck disable=SC2064  # TMPDIR should be expanded here (and not on trap).
     trap "rm -rf $TMPDIR" RETURN 2>/dev/null || true
 
-    # Compile the wrapper with embedded values via -D flags
-    log_info "Compiling SUID wrapper with hash: $SCRIPT_HASH"
-    if ! $CC \
-        -DSCRIPT_EXPECTED_SHA256_HEX="\"$SCRIPT_HASH\"" \
-        -DSCRIPT_SIZE_BYTES="$SCRIPT_SIZE" \
-        -DWRAPPER_FINGERPRINT="\"$WRAPPER_FINGERPRINT\"" \
-        -o "$TMPDIR/be-bop-cli" \
-        "$WRAPPER_TEMPLATE"; then
-        die $EXIT_ERROR $LINENO "Failed to compile be-bop-cli wrapper"
-    fi
+    # The launcher keeps the marker line the wizard reads to tell which launcher is installed.
+    cat > "$TMPDIR/be-bop-cli" << EOF
+#!/bin/bash
+# be-bop-cli-wrapper-fingerprint:$(wizard_file_fingerprint "bebop_cli_wrapper")
+# Runs be-bop-cli as the be-bop-cli account, with a clean environment.
+set -euo pipefail
+readonly REAL=/usr/local/libexec/be-bop-cli.real
+readonly CLEAN_ENV=(env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    HOME=/var/lib/be-BOP USER=be-bop-cli LOGNAME=be-bop-cli LANG=C)
+case "\$(id -un)" in
+    be-bop-cli) exec "\${CLEAN_ENV[@]}" /bin/bash --noprofile --norc "\$REAL" "\$@" ;;
+    # runuser rather than sudo: hosts administered as root only may have no sudo.
+    root) exec runuser -u be-bop-cli -- "\${CLEAN_ENV[@]}" /bin/bash --noprofile --norc "\$REAL" "\$@" ;;
+    *) exec sudo -u be-bop-cli -- "\${CLEAN_ENV[@]}" /bin/bash --noprofile --norc "\$REAL" "\$@" ;;
+esac
+EOF
 
-    # Install the compiled wrapper
-    run_privileged cp "$TMPDIR/be-bop-cli" /usr/local/bin/be-bop-cli
-    run_privileged chown be-bop-cli:be-bop-cli /usr/local/bin/be-bop-cli
-    run_privileged chmod 6755 /usr/local/bin/be-bop-cli
+    run_privileged mkdir -p /usr/local/libexec /usr/local/bin
+    install_file "$CLI_SCRIPT" /usr/local/libexec/be-bop-cli.real 755
+    install_file "$TMPDIR/be-bop-cli" /usr/local/bin/be-bop-cli 755
 
-    log_info "be-BOP CLI v${SCRIPT_VERSION} installed with SUID wrapper"
+    log_info "be-BOP CLI v${SCRIPT_VERSION} installed"
 }
 
 install_bebop_cli_sudoers() {
