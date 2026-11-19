@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.5.18"
+readonly SCRIPT_VERSION="2.5.19"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -572,7 +572,7 @@ wizard_file_fingerprint() {
     # The value is currently internal, but may be exposed in the future.
     local template_rev
     case "${1:-bebop_config}" in
-        bebop_config) template_rev="2026022302" ;;
+        bebop_config) template_rev="2026111801" ;;
         nginx_config) template_rev="2026111801" ;;
         bebop_cli_wrapper) template_rev="2026010601" ;;
         bebop_cli_sudoers) template_rev="2026010601" ;;
@@ -2877,6 +2877,7 @@ write_bebop_configuration() {
 # This configuration is managed by be-bop-wizard
 # wizard-fingerprint: $(wizard_file_fingerprint bebop_config)
 ADDRESS_HEADER=X-Forwarded-For
+HOST=127.0.0.1
 MONGODB_DB=bebop
 MONGODB_URL=mongodb://127.0.0.1:27017
 ORIGIN=https://${domain}
