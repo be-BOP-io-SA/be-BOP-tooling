@@ -46,7 +46,7 @@
 # The “wizard” part is simply automation done with a bit of common sense.
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.5.19"
+readonly SCRIPT_VERSION="2.5.20"
 readonly SCRIPT_NAME="be-bop-wizard"
 readonly SESSION_ID="wizard-$(date +%s)-$$"
 
@@ -297,6 +297,7 @@ run_bebop_cli() {
 install_file() {
     local source="$1"
     local destination="$2"
+    local mode="${3:-}"
 
     if [[ -z "$source" || -z "$destination" ]]; then
         die $EXIT_ERROR $LINENO "Missing source or destination file"
@@ -304,6 +305,12 @@ install_file() {
         die $EXIT_ERROR $LINENO "Source file '$source' does not exist"
     elif [[ "$source" = "$destination" ]]; then
         die $EXIT_ERROR $LINENO "Source and destination files are the same: $source"
+    fi
+
+    # A file holding secrets gets its mode as it is written, never readable by others in between.
+    if [[ -n "$mode" ]]; then
+        run_privileged install -m "$mode" -o root -g root "$source" "$destination"
+        return
     fi
 
     if has_tool ucf; then
@@ -607,7 +614,7 @@ inspect_system_state() {
     # Auto-detect domain from existing config if not provided via CLI
     if [[ -z "${DOMAIN:-}" ]] && [[ -f /etc/be-BOP/config.env ]]; then
         local detected_domain
-        detected_domain=$(grep '^ORIGIN=' /etc/be-BOP/config.env | sed 's|ORIGIN=https\?://||')
+        detected_domain=$(run_privileged grep '^ORIGIN=' /etc/be-BOP/config.env | sed 's|ORIGIN=https\?://||')
         if [[ -n "$detected_domain" ]]; then
             DOMAIN="$detected_domain"
             log_info "Detected domain from existing configuration: $DOMAIN"
@@ -894,7 +901,7 @@ inspect_system_state() {
             die $EXIT_ERROR $LINENO "The wizard cannot function without awk"
         fi
         local awk_command='/^# wizard-fingerprint:/ {print $NF}'
-        local fingerprint="$(awk "$awk_command" /etc/be-BOP/config.env)"
+        local fingerprint="$(run_privileged awk "$awk_command" /etc/be-BOP/config.env)"
         SYSTEM_STATE+=("bebop_config_exists=${fingerprint}")
         if ! validate_bebop_config_domain; then
             SYSTEM_STATE+=("bebop_config_domain_mismatch")
@@ -1033,12 +1040,12 @@ validate_bebop_config_domain() {
         expected_s3_url="https://$(get_fact s3_domain)"
     fi
 
-    if ! grep -q "^ORIGIN=$expected_origin$" /etc/be-BOP/config.env 2>/dev/null; then
+    if ! run_privileged grep -q "^ORIGIN=$expected_origin$" /etc/be-BOP/config.env 2>/dev/null; then
         log_debug "be-BOP config has incorrect ORIGIN (expected: $expected_origin)"
         return 1
     fi
 
-    if ! grep -q "^PUBLIC_S3_ENDPOINT_URL=$expected_s3_url$" /etc/be-BOP/config.env 2>/dev/null; then
+    if ! run_privileged grep -q "^PUBLIC_S3_ENDPOINT_URL=$expected_s3_url$" /etc/be-BOP/config.env 2>/dev/null; then
         log_debug "be-BOP config has incorrect PUBLIC_S3_ENDPOINT_URL (expected: $expected_s3_url)"
         return 1
     fi
@@ -2553,9 +2560,7 @@ be-bop-cli ALL=(root) NOPASSWD: ${systemctl} restart bebop.service, ${systemctl}
 EOF
 
     # Install the sudoers file
-    install_file "$TMPDIR/be-bop-cli-bebop" /etc/sudoers.d/be-bop-cli-bebop
-    run_privileged chmod 440 /etc/sudoers.d/be-bop-cli-bebop
-    run_privileged chown root:root /etc/sudoers.d/be-bop-cli-bebop
+    install_file "$TMPDIR/be-bop-cli-bebop" /etc/sudoers.d/be-bop-cli-bebop 440
 
     log_info "be-BOP CLI sudoers rule installed"
 }
@@ -2675,8 +2680,7 @@ EOF
         fi
     fi
 
-    install_file "$TMPDIR/garage.toml" /etc/garage.toml
-    run_privileged chmod 640 /etc/garage.toml
+    install_file "$TMPDIR/garage.toml" /etc/garage.toml 640
 }
 
 wait_garage_ready() {
@@ -2744,8 +2748,7 @@ GARAGE_KEY_SECRET=${key_secret}
 EOF
 
         run_privileged mkdir -p /etc/garage
-        install_file "$TMPDIR/credentials.env" /etc/garage/credentials.env
-        run_privileged chmod 600 /etc/garage/credentials.env
+        install_file "$TMPDIR/credentials.env" /etc/garage/credentials.env 600
     else
         log_debug "Garage key 'bebop-key' already exists, skipping key creation"
     fi
@@ -2902,16 +2905,16 @@ EOF
     if [[ -f /etc/be-BOP/config.env ]]; then
         # If the file already exists, copy everything from the marker (including
         # the marker) into the new config file.
-        sed -n "/^${marker}"'$/,$p' /etc/be-BOP/config.env >> "$TMPDIR/config.env"
+        # shellcheck disable=SC2016  # $ is sed's end of line and last line.
+        run_privileged sed -n "/^${marker}"'$/,$p' /etc/be-BOP/config.env >> "$TMPDIR/config.env"
     else
         echo "$marker" >> "$TMPDIR/config.env"
         echo '# Put your custom configuration (even new environment variables) after this line' >> "$TMPDIR/config.env"
     fi
 
     run_privileged mkdir -p /etc/be-BOP
-    install_file "$TMPDIR/config.env" /etc/be-BOP/config.env
-    # Ensure it's world-readable (so the configured domain can be checked)
-    run_privileged chmod 644 /etc/be-BOP/config.env
+    # Read by systemd as root: be-BOP gets it through EnvironmentFile.
+    install_file "$TMPDIR/config.env" /etc/be-BOP/config.env 600
 
     # Cleanup
     rm -rf "$TMPDIR"
