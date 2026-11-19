@@ -8,7 +8,7 @@
 
 set -eEuo pipefail
 
-readonly SCRIPT_VERSION="2.5.20"
+readonly SCRIPT_VERSION="2.5.21"
 readonly SCRIPT_NAME="be-bop-cli"
 readonly EXIT_SUCCESS=0
 readonly EXIT_ERROR=1
@@ -261,6 +261,8 @@ fetch_all_releases() {
         "--fail"
         "--location"
         "--max-time" "$CURL_DOWNLOAD_TIMEOUT"
+        "--proto" "=https"
+        "--proto-redir" "=https"
         "--show-error"
         "--silent"
     )
@@ -280,6 +282,7 @@ fetch_all_releases() {
     export ALL_RELEASES_SUMMARY="$(echo "$releases_data" | jq -r "$jq_filter1")"
     local jq_filter2='
       .[]
+      | select((.draft or .prerelease) | not)
       | (.assets |= map(
         select(.name | test("be-BOP\\.release\\.[0-9]{4}-[0-9]{2}-[0-9]{2}\\.[a-f0-9]+.*\\.zip"))
         | {name, browser_download_url}))
@@ -350,11 +353,18 @@ install_release() {
         branch_name="${target_version#branch=}"
         # Apply GitHub's excaping rules
         branch_name="${branch_name//\//__}"
+        # The name becomes a directory under /var/lib/be-BOP/releases.
+        if [[ ! "$branch_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            die_unknown_release "$target_version"
+        fi
         target_url="https://www.artifact.ci/artifact/view/be-BOP-io-SA/be-BOP/branch/$branch_name/be-BOP-release/be-BOP-release.zip"
         target_name="$branch_name"
         ;;
       *)
-        local target_meta="$(echo "$RELEASE_META" | jq -r 'first(.[]|select(.tag_name == "'"$target_version"'"))')"
+        if [[ ! "$target_version" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            die_unknown_release "$target_version"
+        fi
+        local target_meta="$(echo "$RELEASE_META" | jq -r --arg tag "$target_version" 'first(.[]|select(.tag_name == $tag))')"
         target_url="$(echo "$target_meta" | jq -r '.asset_url')"
         target_name="$(echo "$target_meta" | jq -r '.asset_name | sub("\\.zip$"; "")')"
         ;;
@@ -383,6 +393,8 @@ install_release() {
         "--fail"
         "--location"
         "--max-time" "$CURL_DOWNLOAD_TIMEOUT"
+        "--proto" "=https"
+        "--proto-redir" "=https"
         "--progress-bar"
         "--show-error"
         "--output" "be-BOP-update.zip"
